@@ -7,8 +7,10 @@ import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.WorkerParameters
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.InputStream
@@ -84,9 +86,6 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                         idx++
                     }
                 }
-
-                // register manifest entry for finalize
-                // Note: we'll accumulate manifest entries and call finalize per-folder at end
             }
 
             // Build manifest list: all filenames relative (we collected in files list)
@@ -98,9 +97,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
             }
 
             val assignmentsObj = JSONObject()
-            val assignArr = JSONArray()
             if (!portadaSavedAs.isNullOrBlank()) {
-                // assign container_portadas at folder name
                 assignmentsObj.put("container_portadas", JSONObject().put(customName, portadaSavedAs))
             } else {
                 assignmentsObj.put("container_portadas", JSONObject())
@@ -150,11 +147,12 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
     private fun queryReceivedChunks(uploadId: String, filename: String, token: String): Set<Int> {
         try {
-            val url = HttpUrl.parse("$baseUrl/upload/chunk/status")!!.newBuilder()
-                .addQueryParameter("upload_id", uploadId)
-                .addQueryParameter("filename", filename)
-                .addQueryParameter("token", token)
-                .build()
+            val base = "$baseUrl/upload/chunk/status"
+            val url = base.toHttpUrlOrNull()?.newBuilder()
+                ?.addQueryParameter("upload_id", uploadId)
+                ?.addQueryParameter("filename", filename)
+                ?.addQueryParameter("token", token)
+                ?.build() ?: return emptySet()
             val req = Request.Builder().url(url).get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return emptySet()
