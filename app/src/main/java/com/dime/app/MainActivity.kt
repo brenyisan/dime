@@ -23,6 +23,8 @@ import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -43,18 +45,18 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-// Data holder for part state (same as before)
-data class PartState(
-    val index: Int,
-    var progress: Int = 0,
-    var uploaded: Boolean = false,
-    var error: Boolean = false
-)
+// PartState with observable properties so Compose updates when they change
+class PartState(val index: Int) {
+    var progress by mutableStateOf(0)       // 0..100
+    var uploaded by mutableStateOf(false)
+    var error by mutableStateOf(false)
+}
 
 class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
     private val workManager = WorkManager.getInstance(app)
     private val observers = mutableMapOf<UUID, androidx.lifecycle.Observer<WorkInfo>>()
 
+    // Observable UI state list
     private val _parts = mutableStateListOf<PartState>()
     val parts: List<PartState> get() = _parts
 
@@ -78,7 +80,11 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
     fun startMonitoring(workId: UUID, totalParts: Int) {
         clear()
         currentWorkId = workId
-        for (i in 0 until totalParts) _parts.add(PartState(index = i))
+
+        // initialize parts as observable objects
+        for (i in 0 until totalParts) {
+            _parts.add(PartState(index = i))
+        }
 
         val live = workManager.getWorkInfoByIdLiveData(workId)
         val obs = androidx.lifecycle.Observer<WorkInfo> { info ->
