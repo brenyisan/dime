@@ -38,4 +38,26 @@ object UriUtils {
             else -> null
         }
     }
+
+    /**
+     * Ensure the given relative path or filename has an extension.
+     * If it already contains an extension in the last path segment, returns it unchanged.
+     * Otherwise appends defaultExt (e.g. ".mp4") to the last segment.
+     * Preserves any directory prefix.
+     */
+    fun ensureHasExtension(relPath: String, defaultExt: String = ".mp4"): String {
+        val p = relPath.trim()
+        if (p.isEmpty()) return "file$defaultExt"
+        val lastSegment = p.substringAfterLast('/')
+        return if (lastSegment.contains('.') && lastSegment.indexOf('.') != lastSegment.length - 1) {
+            p
+        } else {
+            if (p.endsWith("/")) {
+                // unlikely a folder name; just append a file
+                (p.trimEnd('/') + defaultExt)
+            } else {
+                p + defaultExt
+            }
+        }
+    }
 }
