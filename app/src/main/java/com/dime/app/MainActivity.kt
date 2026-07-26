@@ -1,8 +1,12 @@
 package com.dime.app
 
 import android.app.Application
+import android.content.Context
+import android.database.Cursor
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -39,7 +43,7 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-// Reuse PartState and UploadMonitorViewModel from previous implementation (same behavior)
+// Data holder for part state (same as before)
 data class PartState(
     val index: Int,
     var progress: Int = 0,
@@ -127,6 +131,8 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
+    private val TAG = "MainActivity"
+
     private lateinit var viewModelFactory: ViewModelProvider.Factory
     private val uploadMonitor: UploadMonitorViewModel by viewModels {
         viewModelFactory
@@ -180,7 +186,6 @@ class MainActivity : ComponentActivity() {
                     val jo = JSONObject(body)
                     val user = jo.optJSONObject("user")
                     if (user != null) {
-                        // persist token and server
                         SessionManager.saveToken(applicationContext, token)
                         SessionManager.saveServerUrl(applicationContext, base)
                         withContext(Dispatchers.Main) { onResult(true, user.optString("name", user.optString("id", "User"))) }
@@ -194,8 +199,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Get display name (filename with extension) from a content Uri - returns null if can't resolve
+    private fun getDisplayNameFromUri(ctx: Context, uri: Uri): String? {
+        var name: String? = null
+        try {
+            ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) name = cursor.getString(idx)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "getDisplayNameFromUri error", e)
+        }
+        return name
+    }
+
     private fun startFFmpegThenUpload(fileUri: Uri, token: String, customName: String, description: String, portadaUri: Uri?) {
         val workManager = WorkManager.getInstance(applicationContext)
+        // enqueue FFmpegWorker
         val ffmpegInput = Data.Builder()
             .putString("FILE_URI", fileUri.toString())
             .putString("TOKEN", token)
@@ -208,6 +230,7 @@ class MainActivity : ComponentActivity() {
 
         workManager.enqueue(ffmpegWork)
 
+        // observe ffmpeg completion
         workManager.getWorkInfoByIdLiveData(ffmpegWork.id).observe(this) { info ->
             if (info != null && info.state.isFinished) {
                 if (info.state == WorkInfo.State.SUCCEEDED) {
@@ -221,9 +244,13 @@ class MainActivity : ComponentActivity() {
                     val tsFiles = dir.listFiles { f -> f.name.endsWith(".ts") }?.sortedBy { it.name } ?: emptyList()
                     val totalParts = tsFiles.size.coerceAtLeast(1)
 
-                    val finalName = if (customName.trim().isEmpty()) {
-                        fileUri.lastPathSegment ?: "video_${System.currentTimeMillis()}"
-                    } else customName.trim()
+                    // EXACT behavior: if customName empty -> use original file's DISPLAY_NAME (with extension) if available
+                    val finalName = if (customName.trim().isNotEmpty()) {
+                        customName.trim()
+                    } else {
+                        getDisplayNameFromUri(applicationContext, fileUri)?.takeIf { it.isNotBlank() }
+                            ?: (fileUri.lastPathSegment ?: "video_${System.currentTimeMillis()}")
+                    }
 
                     val uploadInput = Data.Builder()
                         .putString("OUTPUT_DIR", outputDir)
@@ -239,7 +266,6 @@ class MainActivity : ComponentActivity() {
 
                     workManager.enqueue(uploadWork)
                     uploadMonitor.startMonitoring(uploadWork.id, totalParts)
-
                 } else {
                     Toast.makeText(this, "FFmpeg failed", Toast.LENGTH_SHORT).show()
                 }
@@ -266,16 +292,10 @@ fun MainScreen(
     var customName by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
 
-    // Auto-verify on composition if token present
     LaunchedEffect(initialToken, initialServer) {
         if (initialToken.isNotBlank()) {
             onVerifyToken(serverUrl, initialToken) { ok, info ->
-                if (ok) {
-                    tokenVerifiedName = info
-                } else {
-                    tokenVerifiedName = null
-                    // keep token in field but not verified
-                }
+                if (ok) tokenVerifiedName = info else tokenVerifiedName = null
             }
         }
     }
@@ -293,7 +313,6 @@ fun MainScreen(
         Text("DIME - Subidor", style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(8.dp))
 
-        // Server URL editable
         OutlinedTextField(
             value = serverUrl,
             onValueChange = { serverUrl = it },
