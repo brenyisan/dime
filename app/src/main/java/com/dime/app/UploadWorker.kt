@@ -7,7 +7,6 @@ import androidx.work.workDataOf
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
@@ -25,20 +24,22 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
         .readTimeout(180, TimeUnit.SECONDS)
         .build()
 
-    private val baseUrl = "https://inspection-sister-wondering-ask.trycloudflare.com/api"
     private val CHUNK_SIZE = 4 * 1024 * 1024
+
+    private fun baseApi(): String {
+        val server = SessionManager.getServerUrl(applicationContext).trimEnd('/')
+        return "$server/api"
+    }
 
     override suspend fun doWork(): Result {
         val outputDirStr = inputData.getString("OUTPUT_DIR") ?: return Result.failure()
         val token = inputData.getString("TOKEN") ?: return Result.failure()
         var customName = inputData.getString("CUSTOM_NAME") ?: ""
+        customName = customName.trim()
+        if (customName.isEmpty()) customName = "video_${System.currentTimeMillis()}"
+
         val description = inputData.getString("DESCRIPTION") ?: ""
         val portadaUriStr = inputData.getString("PORTADA_URI") ?: ""
-
-        // Normalize custom name and ensure extension
-        customName = customName.trim()
-        if (customName.isEmpty()) customName = "Video_Mobile_${System.currentTimeMillis()}.mp4"
-        customName = UriUtils.ensureHasExtension(customName, ".mp4")
 
         val outputDir = File(outputDirStr)
         if (!outputDir.exists() || !outputDir.isDirectory) return Result.failure()
@@ -46,7 +47,6 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
         val tsFiles = outputDir.listFiles { f -> f.name.endsWith(".ts") }?.sortedBy { it.name } ?: emptyList()
         if (tsFiles.isEmpty()) return Result.failure()
 
-        // upload portada first if present
         var portadaSavedAs: String? = null
         if (portadaUriStr.isNotBlank()) {
             val portadaFile = UriUtils.uriToTempFile(applicationContext, portadaUriStr)
@@ -60,7 +60,6 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
         var bytesUploaded = 0L
         val totalBytes = tsFiles.sumOf { it.length() }
 
-        // Check server for already received chunks for this filename (resume)
         val already = queryReceivedChunks(uploadId, customName, token)
 
         try {
@@ -80,7 +79,6 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
                 setProgress(workDataOf("uploaded_bytes" to bytesUploaded, "total_bytes" to totalBytes, "part_index" to index, "part_progress" to 100, "total_parts" to totalChunks, "overall_percent" to percent))
             }
 
-            // Build assignments JSON referencing existing portada if uploaded
             val assignmentsObj = JSONObject()
             val assignArr = JSONArray()
             if (!portadaSavedAs.isNullOrBlank()) {
@@ -108,7 +106,7 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
     private fun queryReceivedChunks(uploadId: String, filename: String, token: String): Set<Int> {
         try {
-            val base = "$baseUrl/upload/chunk/status"
+            val base = "${baseApi()}/upload/chunk/status"
             val url = base.toHttpUrlOrNull()?.newBuilder()
                 ?.addQueryParameter("upload_id", uploadId)
                 ?.addQueryParameter("filename", filename)
@@ -138,7 +136,7 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
         multipart.addFormDataPart("files", file.name, file.asRequestBody(mediaType.toMediaTypeOrNull()))
 
         val request = Request.Builder()
-            .url("$baseUrl/upload")
+            .url("${baseApi()}/upload")
             .addHeader("x-upload-token", token)
             .post(multipart.build())
             .build()
@@ -167,7 +165,7 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
         multipartBuilder.addFormDataPart("chunk", file.name, file.asRequestBody("video/mp2t".toMediaTypeOrNull()))
 
         val request = Request.Builder()
-            .url("$baseUrl/upload/chunk")
+            .url("${baseApi()}/upload/chunk")
             .addHeader("x-upload-token", token)
             .post(multipartBuilder.build())
             .build()
@@ -198,7 +196,7 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
             .add("assignments", assignmentsJson)
 
         val request = Request.Builder()
-            .url("$baseUrl/upload/finalize")
+            .url("${baseApi()}/upload/finalize")
             .addHeader("x-upload-token", token)
             .post(formBuilder.build())
             .build()
