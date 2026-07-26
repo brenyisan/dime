@@ -3,7 +3,6 @@ package com.dime.app
 import android.app.Application
 import android.net.Uri
 import android.os.Bundle
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -12,6 +11,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
@@ -27,7 +28,6 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
-import androidx.lifecycle.viewModelScope
 import androidx.work.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -39,10 +39,10 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-// Data holder for part state
+// Reuse PartState and UploadMonitorViewModel from previous implementation (same behavior)
 data class PartState(
     val index: Int,
-    var progress: Int = 0,   // 0..100
+    var progress: Int = 0,
     var uploaded: Boolean = false,
     var error: Boolean = false
 )
@@ -51,7 +51,6 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
     private val workManager = WorkManager.getInstance(app)
     private val observers = mutableMapOf<UUID, androidx.lifecycle.Observer<WorkInfo>>()
 
-    // Observable UI state
     private val _parts = mutableStateListOf<PartState>()
     val parts: List<PartState> get() = _parts
 
@@ -62,7 +61,6 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     fun clear() {
-        // remove observers
         observers.forEach { (id, obs) ->
             val live = workManager.getWorkInfoByIdLiveData(id)
             live.removeObserver(obs)
@@ -74,20 +72,13 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun startMonitoring(workId: UUID, totalParts: Int) {
-        // clear previous
         clear()
         currentWorkId = workId
+        for (i in 0 until totalParts) _parts.add(PartState(index = i))
 
-        // initialize parts
-        for (i in 0 until totalParts) {
-            _parts.add(PartState(index = i))
-        }
-
-        // observer
         val live = workManager.getWorkInfoByIdLiveData(workId)
         val obs = androidx.lifecycle.Observer<WorkInfo> { info ->
             if (info == null) return@Observer
-            // Overall percent
             val progressData = info.progress
             val overall = progressData.getInt("overall_percent", -1)
             if (overall >= 0) overallPercent = overall
@@ -95,16 +86,13 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
             val uploadedBytes = progressData.getLong("uploaded_bytes", -1L)
             val totalBytes = progressData.getLong("total_bytes", -1L)
             if (uploadedBytes >= 0 && totalBytes > 0 && overall < 0) {
-                // compute fallback
                 overallPercent = ((uploadedBytes.toDouble() / totalBytes.toDouble()) * 100).toInt()
             }
 
-            // part-level
             val partIndex = progressData.getInt("part_index", -1)
             val partProgress = progressData.getInt("part_progress", -1)
 
             if (partIndex >= 0 && partIndex < _parts.size) {
-                // update part progress
                 val p = _parts[partIndex]
                 if (partProgress >= 0) {
                     p.progress = partProgress
@@ -115,7 +103,6 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            // if worker finished, mark remaining parts as uploaded if success
             if (info.state.isFinished) {
                 if (info.state == WorkInfo.State.SUCCEEDED) {
                     _parts.forEach { part ->
@@ -126,7 +113,6 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     overallPercent = 100
                 } else {
-                    // mark any in-progress as error
                     _parts.forEach { part ->
                         if (!part.uploaded) part.error = true
                     }
@@ -141,9 +127,6 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
-    private val serverBaseNoApi = "https://inspection-sister-wondering-ask.trycloudflare.com"
-    private val serverBaseApi = "$serverBaseNoApi/api"
-
     private lateinit var viewModelFactory: ViewModelProvider.Factory
     private val uploadMonitor: UploadMonitorViewModel by viewModels {
         viewModelFactory
@@ -156,8 +139,16 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
+                    val ctx = LocalContext.current
+                    val savedToken = SessionManager.getToken(ctx)
+                    val savedServer = SessionManager.getServerUrl(ctx)
+
                     MainScreen(
-                        onVerifyToken = { token, onResult -> verifyToken(token, onResult) },
+                        initialToken = savedToken,
+                        initialServer = savedServer,
+                        onVerifyToken = { serverBase, token, onResult ->
+                            verifyToken(serverBase, token, onResult)
+                        },
                         onStartFFmpegAndUpload = { fileUri, token, customName, description, portadaUri ->
                             startFFmpegThenUpload(fileUri, token, customName, description, portadaUri)
                         },
@@ -168,16 +159,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun verifyToken(token: String, onResult: (Boolean, String) -> Unit) {
-        // Use lifecycleScope so withContext calls are inside coroutine
+    private fun verifyToken(serverBase: String, token: String, onResult: (Boolean, String) -> Unit) {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
+                val base = serverBase.trimEnd('/')
                 val client = OkHttpClient.Builder()
                     .connectTimeout(10, TimeUnit.SECONDS)
                     .readTimeout(10, TimeUnit.SECONDS)
                     .build()
                 val req = Request.Builder()
-                    .url("$serverBaseApi/user/whoami?token=${token}")
+                    .url("$base/api/user/whoami?token=${token}")
                     .get()
                     .build()
                 client.newCall(req).execute().use { resp ->
@@ -189,7 +180,9 @@ class MainActivity : ComponentActivity() {
                     val jo = JSONObject(body)
                     val user = jo.optJSONObject("user")
                     if (user != null) {
+                        // persist token and server
                         SessionManager.saveToken(applicationContext, token)
+                        SessionManager.saveServerUrl(applicationContext, base)
                         withContext(Dispatchers.Main) { onResult(true, user.optString("name", user.optString("id", "User"))) }
                     } else {
                         withContext(Dispatchers.Main) { onResult(false, "no user") }
@@ -203,7 +196,6 @@ class MainActivity : ComponentActivity() {
 
     private fun startFFmpegThenUpload(fileUri: Uri, token: String, customName: String, description: String, portadaUri: Uri?) {
         val workManager = WorkManager.getInstance(applicationContext)
-        // 1) enqueue FFmpegWorker
         val ffmpegInput = Data.Builder()
             .putString("FILE_URI", fileUri.toString())
             .putString("TOKEN", token)
@@ -216,7 +208,6 @@ class MainActivity : ComponentActivity() {
 
         workManager.enqueue(ffmpegWork)
 
-        // observe ffmpeg completion
         workManager.getWorkInfoByIdLiveData(ffmpegWork.id).observe(this) { info ->
             if (info != null && info.state.isFinished) {
                 if (info.state == WorkInfo.State.SUCCEEDED) {
@@ -226,12 +217,10 @@ class MainActivity : ComponentActivity() {
                         Toast.makeText(this, "FFmpeg: no segments", Toast.LENGTH_LONG).show()
                         return@observe
                     }
-                    // count .ts parts
                     val dir = File(outputDir)
                     val tsFiles = dir.listFiles { f -> f.name.endsWith(".ts") }?.sortedBy { it.name } ?: emptyList()
                     val totalParts = tsFiles.size.coerceAtLeast(1)
 
-                    // Build upload input (use provided customName EXACTLY if present; else use original URi lastPathSegment)
                     val finalName = if (customName.trim().isEmpty()) {
                         fileUri.lastPathSegment ?: "video_${System.currentTimeMillis()}"
                     } else customName.trim()
@@ -249,8 +238,6 @@ class MainActivity : ComponentActivity() {
                         .build()
 
                     workManager.enqueue(uploadWork)
-
-                    // start monitoring progress in ViewModel
                     uploadMonitor.startMonitoring(uploadWork.id, totalParts)
 
                 } else {
@@ -261,37 +248,70 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
-    onVerifyToken: (String, (Boolean, String) -> Unit) -> Unit,
+    initialToken: String,
+    initialServer: String,
+    onVerifyToken: (String, String, (Boolean, String) -> Unit) -> Unit,
     onStartFFmpegAndUpload: (Uri, String, String, String, Uri?) -> Unit,
     uploadMonitor: UploadMonitorViewModel
 ) {
     val ctx = LocalContext.current
-    var token by remember { mutableStateOf(SessionManager.getToken(ctx)) }
+    var token by remember { mutableStateOf(initialToken) }
+    var serverUrl by remember { mutableStateOf(initialServer) }
     var tokenVerifiedName by remember { mutableStateOf<String?>(null) }
     var selectedVideoUri by remember { mutableStateOf<Uri?>(null) }
     var selectedPortadaUri by remember { mutableStateOf<Uri?>(null) }
     var customName by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
 
+    // Auto-verify on composition if token present
+    LaunchedEffect(initialToken, initialServer) {
+        if (initialToken.isNotBlank()) {
+            onVerifyToken(serverUrl, initialToken) { ok, info ->
+                if (ok) {
+                    tokenVerifiedName = info
+                } else {
+                    tokenVerifiedName = null
+                    // keep token in field but not verified
+                }
+            }
+        }
+    }
+
+    val scrollState = rememberScrollState()
     val filePickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? -> selectedVideoUri = uri }
     val imagePickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? -> selectedPortadaUri = uri }
 
-    Column(modifier = Modifier
-        .fillMaxSize()
-        .padding(16.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(scrollState)
+            .padding(16.dp)
+    ) {
         Text("DIME - Subidor", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(8.dp))
+
+        // Server URL editable
+        OutlinedTextField(
+            value = serverUrl,
+            onValueChange = { serverUrl = it },
+            label = { Text("URL del servidor (base, sin /api)") },
+            modifier = Modifier.fillMaxWidth()
+        )
         Spacer(Modifier.height(8.dp))
 
         OutlinedTextField(value = token, onValueChange = { token = it }, label = { Text("Token") }, modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
         Row {
             Button(onClick = {
-                onVerifyToken(token) { ok, info ->
+                onVerifyToken(serverUrl, token) { ok, info ->
                     if (ok) {
                         tokenVerifiedName = info
                         SessionManager.saveToken(ctx, token)
+                        SessionManager.saveServerUrl(ctx, serverUrl.trimEnd('/'))
+                        Toast.makeText(ctx, "Conectado: $info", Toast.LENGTH_SHORT).show()
                     } else {
                         tokenVerifiedName = null
                         Toast.makeText(ctx, "Token inválido", Toast.LENGTH_SHORT).show()
@@ -327,7 +347,6 @@ fun MainScreen(
 
         Spacer(Modifier.height(16.dp))
 
-        // Progress overview
         Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(8.dp)) {
             Column(modifier = Modifier.padding(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -342,7 +361,6 @@ fun MainScreen(
 
                 Spacer(Modifier.height(12.dp))
 
-                // Grid of parts
                 val parts = uploadMonitor.parts
                 if (parts.isEmpty()) {
                     Text("No hay subidas activas", color = Color.Gray)
@@ -370,23 +388,24 @@ fun MainScreen(
                     Toast.makeText(ctx, "Selecciona video y token", Toast.LENGTH_SHORT).show()
                     return@Button
                 }
-                // start FFmpeg + upload; uses exact customName semantics already described
                 onStartFFmpegAndUpload(selectedVideoUri!!, token, customName, description, selectedPortadaUri)
             },
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Procesar y Subir")
         }
+
+        Spacer(modifier = Modifier.height(32.dp))
     }
 }
 
 @Composable
 fun PartBox(part: PartState) {
     val bgColor = when {
-        part.error -> Color(0xFFD9534F) // red
-        part.uploaded -> Color(0xFF28A745) // green
-        part.progress > 0 -> Color(0xFF2A9DF4) // blue
-        else -> Color(0xFF3A3A3A) // dark gray
+        part.error -> Color(0xFFD9534F)
+        part.uploaded -> Color(0xFF28A745)
+        part.progress > 0 -> Color(0xFF2A9DF4)
+        else -> Color(0xFF3A3A3A)
     }
     Card(
         modifier = Modifier
