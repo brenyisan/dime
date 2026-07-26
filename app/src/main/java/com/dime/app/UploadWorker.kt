@@ -8,9 +8,14 @@ import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.asRequestBody
+import okio.Buffer
+import okio.ForwardingSink
+import okio.Okio
+import okio.Sink
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
@@ -30,6 +35,37 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
     private fun baseApi(): String {
         val server = SessionManager.getServerUrl(applicationContext).trimEnd('/')
         return "$server/api"
+    }
+
+    // Counting wrapper for RequestBody that reports progress
+    class CountingRequestBody(
+        private val delegate: RequestBody,
+        private val onProgress: (bytesWritten: Long, contentLength: Long) -> Unit
+    ) : RequestBody() {
+        override fun contentType(): MediaType? = delegate.contentType()
+        @Throws(IOException::class)
+        override fun contentLength(): Long = try {
+            delegate.contentLength()
+        } catch (e: Exception) {
+            -1L
+        }
+
+        @Throws(IOException::class)
+        override fun writeTo(sink: okio.BufferedSink) {
+            val countingSink = object : ForwardingSink(sink) {
+                var bytesWritten = 0L
+                val total = contentLength()
+                @Throws(IOException::class)
+                override fun write(source: Buffer, byteCount: Long) {
+                    super.write(source, byteCount)
+                    bytesWritten += byteCount
+                    onProgress(bytesWritten, if (total >= 0) total else -1L)
+                }
+            }
+            val buffered = Okio.buffer(countingSink)
+            delegate.writeTo(buffered)
+            buffered.flush()
+        }
     }
 
     override suspend fun doWork(): Result {
@@ -54,6 +90,9 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
             val portadaFile = UriUtils.uriToTempFile(applicationContext, portadaUriStr)
             if (portadaFile != null && portadaFile.exists()) {
                 portadaSavedAs = uploadPortadaFile(portadaFile, token)
+                Log.i(TAG, "Portada uploaded saved_as=$portadaSavedAs")
+            } else {
+                Log.w(TAG, "Portada temp file missing or unreadable")
             }
         }
 
@@ -68,28 +107,32 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
             for ((index, file) in tsFiles.withIndex()) {
                 if (already.contains(index)) {
                     bytesUploaded += file.length()
-                    setProgress(workDataOf("uploaded_bytes" to bytesUploaded, "total_bytes" to totalBytes, "part_index" to index, "part_progress" to 100, "total_parts" to totalChunks))
+                    setProgress(workDataOf(
+                        "uploaded_bytes" to bytesUploaded,
+                        "total_bytes" to totalBytes,
+                        "part_index" to index,
+                        "part_progress" to 100,
+                        "total_parts" to totalChunks
+                    ))
                     continue
                 }
 
-                // Log exact payload details before sending (helps debugging/comparison with Python client)
                 Log.i(TAG, "Uploading chunk -> upload_id=$uploadId filename=$customName chunkIndex=$index partFile=${file.name}")
 
                 // set part start
                 setProgress(workDataOf("part_index" to index, "part_progress" to 0, "total_parts" to totalChunks))
 
-                val ok = uploadTsChunk(uploadId, token, index, totalChunks, file, customName)
-                if (!ok) {
-                    // Try retry with appended .mp4 only if server rejects due to missing extension
+                val success = uploadTsChunkWithProgress(uploadId, token, index, totalChunks, file, customName)
+                if (!success) {
+                    // retry with .mp4 appended if missing extension
                     if (!customName.contains('.')) {
                         val alt = "$customName.mp4"
                         Log.i(TAG, "Retry upload with alt filename: $alt")
-                        val ok2 = uploadTsChunk(uploadId, token, index, totalChunks, file, alt)
+                        val ok2 = uploadTsChunkWithProgress(uploadId, token, index, totalChunks, file, alt)
                         if (!ok2) {
                             outputDir.deleteRecursively()
                             return Result.retry()
                         } else {
-                            // update customName to alt for subsequent parts and finalization
                             customName = alt
                         }
                     } else {
@@ -100,7 +143,14 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
 
                 bytesUploaded += file.length()
                 val percent = if (totalBytes > 0) ((bytesUploaded.toDouble() / totalBytes) * 100).roundToInt() else 0
-                setProgress(workDataOf("uploaded_bytes" to bytesUploaded, "total_bytes" to totalBytes, "part_index" to index, "part_progress" to 100, "total_parts" to totalChunks, "overall_percent" to percent))
+                setProgress(workDataOf(
+                    "uploaded_bytes" to bytesUploaded,
+                    "total_bytes" to totalBytes,
+                    "part_index" to index,
+                    "part_progress" to 100,
+                    "total_parts" to totalChunks,
+                    "overall_percent" to percent
+                ))
             }
 
             // finalize
@@ -187,18 +237,20 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         }
     }
 
-    /**
-     * Upload a single .ts part, matching Python client exactly:
-     * - form fields: upload_id, filename (CUSTOM_NAME), chunk_index, total_chunks
-     * - file part: field 'chunk', filename = partFile.name, content-type 'video/MP2T'
-     */
-    private fun uploadTsChunk(uploadId: String, token: String, chunkIndex: Int, totalChunks: Int, file: File, filenameForServer: String): Boolean {
+    private fun uploadTsChunkWithProgress(uploadId: String, token: String, chunkIndex: Int, totalChunks: Int, file: File, filenameForServer: String): Boolean {
+        val fileReq = file.asRequestBody("video/mp2t".toMediaTypeOrNull())
+        val counting = CountingRequestBody(fileReq) { written, total ->
+            val pct = if (total > 0) ((written * 100.0) / total).toInt() else 0
+            // Update part progress live
+            setProgress(workDataOf("part_index" to chunkIndex, "part_progress" to pct, "total_parts" to totalChunks))
+        }
+
         val multipartBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
         multipartBuilder.addFormDataPart("upload_id", uploadId)
         multipartBuilder.addFormDataPart("filename", filenameForServer)
         multipartBuilder.addFormDataPart("chunk_index", chunkIndex.toString())
         multipartBuilder.addFormDataPart("total_chunks", totalChunks.toString())
-        multipartBuilder.addFormDataPart("chunk", file.name, file.asRequestBody("video/MP2T".toMediaTypeOrNull()))
+        multipartBuilder.addFormDataPart("chunk", file.name, counting)
 
         val request = Request.Builder()
             .url("${baseApi()}/upload/chunk")
