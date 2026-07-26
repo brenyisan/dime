@@ -1,6 +1,7 @@
 package com.dime.app
 
 import android.content.Context
+import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
@@ -18,6 +19,7 @@ import kotlin.math.roundToInt
 class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
     CoroutineWorker(appContext, workerParams) {
 
+    private val TAG = "UploadWorker"
     private val client = OkHttpClient.Builder()
         .connectTimeout(180, TimeUnit.SECONDS)
         .writeTimeout(180, TimeUnit.SECONDS)
@@ -69,13 +71,18 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
                     setProgress(workDataOf("uploaded_bytes" to bytesUploaded, "total_bytes" to totalBytes, "part_index" to index, "part_progress" to 100, "total_parts" to totalChunks))
                     continue
                 }
-                val success = uploadTsChunk(uploadId, token, index, totalChunks, file, customName)
+
+                // Report starting this part (helps UI)
+                setProgress(workDataOf("part_index" to index, "part_progress" to 0, "total_parts" to totalChunks))
+
+                val success = uploadTsChunkWithRecovery(uploadId, token, index, totalChunks, file, customName)
                 if (!success) {
                     outputDir.deleteRecursively()
                     return Result.retry()
                 }
                 bytesUploaded += file.length()
                 val percent = if (totalBytes > 0) ((bytesUploaded.toDouble() / totalBytes) * 100).roundToInt() else 0
+                // report finished part
                 setProgress(workDataOf("uploaded_bytes" to bytesUploaded, "total_bytes" to totalBytes, "part_index" to index, "part_progress" to 100, "total_parts" to totalChunks, "overall_percent" to percent))
             }
 
@@ -98,6 +105,7 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
             outputDir.deleteRecursively()
             return if (finalized) Result.success() else Result.retry()
         } catch (e: Exception) {
+            Log.e(TAG, "Error doWork", e)
             e.printStackTrace()
             outputDir.deleteRecursively()
             return Result.failure()
@@ -123,6 +131,7 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
                 return set
             }
         } catch (e: Exception) {
+            Log.w(TAG, "queryReceivedChunks error", e)
             return emptySet()
         }
     }
@@ -143,7 +152,10 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
         client.newCall(request).execute().use { resp ->
             val bodyStr = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) return null
+            if (!resp.isSuccessful) {
+                Log.w(TAG, "uploadPortadaFile failed: ${resp.code} - $bodyStr")
+                return null
+            }
             try {
                 val jo = JSONObject(bodyStr)
                 val details = jo.optJSONArray("details")
@@ -151,18 +163,42 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
                     val d0 = details.getJSONObject(0)
                     return d0.optString("saved_as", null)
                 }
-            } catch (e: Exception) { e.printStackTrace() }
+            } catch (e: Exception) {
+                Log.w(TAG, "uploadPortadaFile parse error", e)
+            }
             return null
         }
     }
 
-    private fun uploadTsChunk(uploadId: String, token: String, chunkIndex: Int, totalChunks: Int, file: File, videoName: String): Boolean {
+    /**
+     * Try to upload a .ts chunk. If server returns 400 and filename lacks extension,
+     * retry once appending .mp4 to filename (server may validate extension).
+     *
+     * Also use multipart field 'chunk' with filename 'chunk' (like Python client).
+     */
+    private fun uploadTsChunkWithRecovery(uploadId: String, token: String, chunkIndex: Int, totalChunks: Int, file: File, videoName: String): Boolean {
+        // First attempt using videoName as filename in form field 'filename'
+        val ok = uploadTsChunk(uploadId, token, chunkIndex, totalChunks, file, videoName, chunkFilename = "chunk")
+        if (ok) return true
+
+        // If failed with 400 and videoName missing extension, try with suffix .mp4
+        if (!videoName.contains('.')) {
+            val altName = "$videoName.mp4"
+            Log.i(TAG, "Retrying chunk with alt filename: $altName")
+            return uploadTsChunk(uploadId, token, chunkIndex, totalChunks, file, altName, chunkFilename = "chunk")
+        }
+
+        return false
+    }
+
+    private fun uploadTsChunk(uploadId: String, token: String, chunkIndex: Int, totalChunks: Int, file: File, videoName: String, chunkFilename: String): Boolean {
         val multipartBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
         multipartBuilder.addFormDataPart("upload_id", uploadId)
         multipartBuilder.addFormDataPart("filename", videoName)
         multipartBuilder.addFormDataPart("chunk_index", chunkIndex.toString())
         multipartBuilder.addFormDataPart("total_chunks", totalChunks.toString())
-        multipartBuilder.addFormDataPart("chunk", file.name, file.asRequestBody("video/mp2t".toMediaTypeOrNull()))
+        // Use filename 'chunk' for the file part (matches Python client)
+        multipartBuilder.addFormDataPart("chunk", chunkFilename, file.asRequestBody("video/mp2t".toMediaTypeOrNull()))
 
         val request = Request.Builder()
             .url("${baseApi()}/upload/chunk")
@@ -172,13 +208,11 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
         client.newCall(request).execute().use { resp ->
             val bodyStr = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) return false
-            try {
-                val jo = JSONObject(bodyStr)
-                val status = jo.optString("status")
-                return status == "chunk_received" || resp.isSuccessful
-            } catch (e: Exception) {
-                return resp.isSuccessful
+            if (resp.isSuccessful) {
+                return true
+            } else {
+                Log.w(TAG, "uploadTsChunk failed: code=${resp.code} body=$bodyStr upload_id=$uploadId filename=$videoName chunkIndex=$chunkIndex")
+                return false
             }
         }
     }
@@ -203,7 +237,10 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
         client.newCall(request).execute().use { resp ->
             val bodyStr = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) return false
+            if (!resp.isSuccessful) {
+                Log.w(TAG, "finalizeUpload failed: ${resp.code} - $bodyStr")
+                return false
+            }
             try {
                 val jo = JSONObject(bodyStr)
                 val details = jo.optJSONArray("details") ?: return false
@@ -213,6 +250,7 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
                 }
                 return true
             } catch (e: Exception) {
+                Log.w(TAG, "finalizeUpload parse error", e)
                 return resp.isSuccessful
             }
         }
