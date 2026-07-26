@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import androidx.work.*
@@ -164,6 +165,8 @@ fun UploadScreen(
     var description by remember { mutableStateOf("") }
     var modeIsFolder by remember { mutableStateOf(false) }
 
+    val ctx = LocalContext.current
+
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? -> selectedVideoUri = uri }
@@ -190,7 +193,7 @@ fun UploadScreen(
                 }
             }) { Text("✅ Verificar token") }
             Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { token = ""; tokenVerifiedName = null; SessionManager.clearToken(LocalContext.current) }) { Text("🚪 Cerrar sesión") }
+            Button(onClick = { token = ""; tokenVerifiedName = null; SessionManager.clearToken(ctx) }) { Text("🚪 Cerrar sesión") }
         }
 
         tokenVerifiedName?.let {
@@ -203,9 +206,17 @@ fun UploadScreen(
         Row {
             Text("Modo:")
             Spacer(modifier = Modifier.width(8.dp))
-            FilterChip(selected = !modeIsFolder, onClick = { modeIsFolder = false }) { Text("Video (FFmpeg)") }
+            FilterChip(
+                selected = !modeIsFolder,
+                onClick = { modeIsFolder = false },
+                label = { Text("Video (FFmpeg)") }
+            )
             Spacer(modifier = Modifier.width(8.dp))
-            FilterChip(selected = modeIsFolder, onClick = { modeIsFolder = true }) { Text("Carpeta") }
+            FilterChip(
+                selected = modeIsFolder,
+                onClick = { modeIsFolder = true },
+                label = { Text("Carpeta") }
+            )
         }
 
         Spacer(modifier = Modifier.height(8.dp))
