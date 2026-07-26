@@ -87,6 +87,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         collectFilesRec(docFile, "", files, docFile)
         if (files.isEmpty()) return Result.failure()
 
+        // upload portada first if provided, get saved filename
         var portadaSavedAs: String? = null
         if (portadaUriStr.isNotBlank()) {
             val tmp = UriUtils.uriToTempFile(ctx, portadaUriStr)
@@ -96,14 +97,17 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
             }
         }
 
+        // Use a single upload_id for the entire folder upload
+        val uploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
+
         try {
             val manifestArr = JSONArray()
 
+            // iterate files and upload chunks using same uploadId
             for ((doc, relPath) in files) {
                 val rel = relPath.trim()
                 val size = doc.length()
                 val totalChunks = if (size <= 0) 1 else ceil(size.toDouble() / CHUNK_SIZE.toDouble()).toInt()
-                val uploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
 
                 val received = queryReceivedChunks(uploadId, rel, token)
 
@@ -136,20 +140,20 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
                 manifestArr.put(o)
             }
 
+            // finalize using the same uploadId
             val assignmentsObj = JSONObject()
+            val containerPortadas = JSONObject()
             if (!portadaSavedAs.isNullOrBlank()) {
-                assignmentsObj.put("container_portadas", JSONObject().put(customName, portadaSavedAs))
-            } else {
-                assignmentsObj.put("container_portadas", JSONObject())
+                containerPortadas.put(customName, portadaSavedAs)
             }
+            assignmentsObj.put("container_portadas", containerPortadas)
             assignmentsObj.put("assignments", JSONArray())
             val descs = JSONObject()
             if (description.isNotBlank()) descs.put(customName, description)
             assignmentsObj.put("descriptions", descs)
 
-            val uploadIdForFinalize = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
             val form = FormBody.Builder()
-                .add("upload_id", uploadIdForFinalize)
+                .add("upload_id", uploadId)
                 .add("carpeta", customName)
                 .add("portada_mode", "container")
                 .add("generate_quick", "1")
