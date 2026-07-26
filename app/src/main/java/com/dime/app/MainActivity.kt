@@ -1,5 +1,6 @@
 package com.dime.app
 
+import android.app.Application
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
@@ -8,6 +9,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -22,7 +24,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.*
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
 import androidx.work.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -97,8 +101,6 @@ class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
             // part-level
             val partIndex = progressData.getInt("part_index", -1)
             val partProgress = progressData.getInt("part_progress", -1)
-            val totalPartsReported = progressData.getInt("total_parts", -1)
-            // Some workers may report "total_parts_for_file" or other keys; we rely on provided totalParts param above
 
             if (partIndex >= 0 && partIndex < _parts.size) {
                 // update part progress
