@@ -5,7 +5,9 @@ import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import okhttp3.*
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
@@ -101,11 +103,12 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
     private fun queryReceivedChunks(uploadId: String, filename: String, token: String): Set<Int> {
         try {
-            val url = HttpUrl.parse("$baseUrl/upload/chunk/status")!!.newBuilder()
-                .addQueryParameter("upload_id", uploadId)
-                .addQueryParameter("filename", filename)
-                .addQueryParameter("token", token)
-                .build()
+            val base = "$baseUrl/upload/chunk/status"
+            val url = base.toHttpUrlOrNull()?.newBuilder()
+                ?.addQueryParameter("upload_id", uploadId)
+                ?.addQueryParameter("filename", filename)
+                ?.addQueryParameter("token", token)
+                ?.build() ?: return emptySet()
             val req = Request.Builder().url(url).get().build()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return emptySet()
