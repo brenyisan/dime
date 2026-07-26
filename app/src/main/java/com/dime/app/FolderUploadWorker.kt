@@ -1,5 +1,7 @@
 package com.dime.app
 
+import android.content.Context
+import android.net.Uri
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import androidx.work.CoroutineWorker
@@ -9,13 +11,15 @@ import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
 
-class FolderUploadWorker(appContext: android.content.Context, workerParams: WorkerParameters) :
+class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
     CoroutineWorker(appContext, workerParams) {
 
     private val TAG = "FolderUploadWorker"
@@ -40,7 +44,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         val portadaUriStr = inputData.getString("PORTADA_URI") ?: ""
 
         val ctx = applicationContext
-        val tree = android.net.Uri.parse(folderUriStr)
+        val tree = Uri.parse(folderUriStr)
         val docFile = DocumentFile.fromTreeUri(ctx, tree) ?: return Result.failure()
 
         val files = mutableListOf<Pair<DocumentFile, String>>()
@@ -58,7 +62,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         try {
             val manifestArr = JSONArray()
             for ((doc, relPath) in files) {
-                val rel = relPath.trim() // exact rel path
+                val rel = relPath.trim()
                 val size = doc.length()
                 val totalChunks = if (size <= 0) 1 else ceil(size.toDouble() / CHUNK_SIZE.toDouble()).toInt()
                 val uploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
@@ -80,8 +84,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
                         // Report progress start for this chunk
                         setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 0).putInt("total_parts_for_file", totalChunks).build())
 
-                        // upload chunk bytes — match Python: field chunk uses filename "chunk" and application/octet-stream
-                        val ok = uploadChunkBytes(uploadId, token, rel, idx, totalChunks, bytes)
+                        val ok = uploadChunkBytesWithRecovery(uploadId, token, rel, idx, totalChunks, bytes)
                         if (!ok) return Result.retry()
 
                         // Report finished chunk
@@ -133,6 +136,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
             }
         } catch (e: Exception) {
             Log.e(TAG, "doWork failed", e)
+            e.printStackTrace()
             return Result.failure()
         }
     }
@@ -174,13 +178,26 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         }
     }
 
+    private fun uploadChunkBytesWithRecovery(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
+        val ok = uploadChunkBytes(uploadId, token, filename, chunkIndex, totalChunks, bytes)
+        if (ok) return true
+
+        // If filename lacks dot/extension, try with .mp4 appended
+        if (!filename.contains('.')) {
+            val alt = "$filename.mp4"
+            Log.i(TAG, "Retrying chunk with alt filename: $alt")
+            return uploadChunkBytes(uploadId, token, alt, chunkIndex, totalChunks, bytes)
+        }
+        return false
+    }
+
     private fun uploadChunkBytes(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
         val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
         multipart.addFormDataPart("upload_id", uploadId)
         multipart.addFormDataPart("filename", filename)
         multipart.addFormDataPart("chunk_index", chunkIndex.toString())
         multipart.addFormDataPart("total_chunks", totalChunks.toString())
-        // file part name "chunk", filename "chunk", body = bytes, content-type application/octet-stream
+        // file part: field "chunk", filename "chunk", body bytes
         multipart.addFormDataPart("chunk", "chunk", bytes.toRequestBody("application/octet-stream".toMediaTypeOrNull()))
 
         val req = Request.Builder()
@@ -200,7 +217,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         }
     }
 
-    private fun uploadPortadaFile(file: java.io.File, token: String): String? {
+    private fun uploadPortadaFile(file: File, token: String): String? {
         val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
         multipart.addFormDataPart("carpeta", "")
         multipart.addFormDataPart("portada_mode", "container")
