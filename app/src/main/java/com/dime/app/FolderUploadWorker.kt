@@ -10,7 +10,6 @@ import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -26,8 +25,12 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         .readTimeout(180, TimeUnit.SECONDS)
         .build()
 
-    private val baseUrl = "https://inspection-sister-wondering-ask.trycloudflare.com/api"
     private val CHUNK_SIZE = 4 * 1024 * 1024
+
+    private fun baseApi(): String {
+        val server = SessionManager.getServerUrl(applicationContext).trimEnd('/')
+        return "$server/api"
+    }
 
     override suspend fun doWork(): Result {
         val folderUriStr = inputData.getString("FOLDER_URI") ?: return Result.failure()
@@ -40,12 +43,10 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         val tree = Uri.parse(folderUriStr)
         val docFile = DocumentFile.fromTreeUri(ctx, tree) ?: return Result.failure()
 
-        // Collect files recursively
         val files = mutableListOf<Pair<DocumentFile, String>>()
         collectFilesRec(docFile, "", files, docFile)
         if (files.isEmpty()) return Result.failure()
 
-        // Upload portada if provided
         var portadaSavedAs: String? = null
         if (portadaUriStr.isNotBlank()) {
             val tmp = UriUtils.uriToTempFile(ctx, portadaUriStr)
@@ -56,16 +57,13 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
         try {
             val manifestArr = JSONArray()
-            for ((doc, relOrig) in files) {
-                val relTrim = relOrig.trim()
-                // Ensure extension for the server validation
-                val filenameForServer = UriUtils.ensureHasExtension(relTrim, ".mp4")
-                // chunk handling
+            for ((doc, relPath) in files) {
+                val rel = relPath.trim()
                 val size = doc.length()
-                val totalChunks = ceil(size.toDouble() / CHUNK_SIZE.toDouble()).toInt()
+                val totalChunks = if (size <= 0) 1 else ceil(size.toDouble() / CHUNK_SIZE.toDouble()).toInt()
                 val uploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
 
-                val received = queryReceivedChunks(uploadId, filenameForServer, token)
+                val received = queryReceivedChunks(uploadId, rel, token)
 
                 ctx.contentResolver.openInputStream(doc.uri)?.use { input ->
                     var idx = 0
@@ -78,7 +76,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                             continue
                         }
                         val bytes = if (read == buf.size) buf else buf.copyOf(read)
-                        val ok = uploadChunkBytes(uploadId, token, filenameForServer, idx, totalChunks, bytes)
+                        val ok = uploadChunkBytes(uploadId, token, rel, idx, totalChunks, bytes)
                         if (!ok) return Result.retry()
                         setProgress(Data.Builder().putInt("part_index", idx).putInt("total_parts_for_file", totalChunks).build())
                         idx++
@@ -86,7 +84,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                 }
 
                 val o = JSONObject()
-                o.put("filename", filenameForServer)
+                o.put("filename", rel)
                 manifestArr.put(o)
             }
 
@@ -113,7 +111,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                 .build()
 
             val req = Request.Builder()
-                .url("$baseUrl/upload/finalize")
+                .url("${baseApi()}/upload/finalize")
                 .addHeader("x-upload-token", token)
                 .post(form)
                 .build()
@@ -127,20 +125,22 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         }
     }
 
-    private fun collectFilesRec(root: DocumentFile, baseName: String, acc: MutableList<Pair<DocumentFile, String>>, current: DocumentFile) {
+    private fun collectFilesRec(root: DocumentFile, baseRel: String, acc: MutableList<Pair<DocumentFile, String>>, current: DocumentFile) {
         if (current.isFile) {
             val name = current.name?.trim() ?: return
-            acc.add(Pair(current, name))
+            val rel = if (baseRel.isBlank()) name else "$baseRel/$name"
+            acc.add(Pair(current, rel))
         } else if (current.isDirectory) {
+            val currentBase = if (baseRel.isBlank()) (current.name ?: "") else "$baseRel/${current.name ?: ""}"
             for (c in current.listFiles()) {
-                collectFilesRec(root, baseName, acc, c)
+                collectFilesRec(root, currentBase, acc, c)
             }
         }
     }
 
     private fun queryReceivedChunks(uploadId: String, filename: String, token: String): Set<Int> {
         try {
-            val base = "$baseUrl/upload/chunk/status"
+            val base = "${baseApi()}/upload/chunk/status"
             val url = base.toHttpUrlOrNull()?.newBuilder()
                 ?.addQueryParameter("upload_id", uploadId)
                 ?.addQueryParameter("filename", filename)
@@ -170,7 +170,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         multipart.addFormDataPart("chunk", "chunk", bytes.toRequestBody("application/octet-stream".toMediaTypeOrNull()))
 
         val req = Request.Builder()
-            .url("$baseUrl/upload/chunk")
+            .url("${baseApi()}/upload/chunk")
             .addHeader("x-upload-token", token)
             .post(multipart.build())
             .build()
@@ -187,7 +187,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         multipart.addFormDataPart("generate_quick", "0")
         val mediaType = UriUtils.guessMimeType(file.name) ?: "application/octet-stream"
         multipart.addFormDataPart("files", file.name, file.asRequestBody(mediaType.toMediaTypeOrNull()))
-        val request = Request.Builder().url("$baseUrl/upload").addHeader("x-upload-token", token).post(multipart.build()).build()
+        val request = Request.Builder().url("${baseApi()}/upload").addHeader("x-upload-token", token).post(multipart.build()).build()
         client.newCall(request).execute().use { resp ->
             val bodyStr = resp.body?.string().orEmpty()
             if (!resp.isSuccessful) return null
