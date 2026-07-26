@@ -2,18 +2,27 @@ package com.dime.app
 
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.*
 import androidx.work.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -21,26 +30,135 @@ import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import java.io.File
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
-class MainActivity : ComponentActivity() {
+// Data holder for part state
+data class PartState(
+    val index: Int,
+    var progress: Int = 0,   // 0..100
+    var uploaded: Boolean = false,
+    var error: Boolean = false
+)
 
+class UploadMonitorViewModel(app: Application) : AndroidViewModel(app) {
+    private val workManager = WorkManager.getInstance(app)
+    private val observers = mutableMapOf<UUID, androidx.lifecycle.Observer<WorkInfo>>()
+
+    // Observable UI state
+    private val _parts = mutableStateListOf<PartState>()
+    val parts: List<PartState> get() = _parts
+
+    var overallPercent by mutableStateOf(0)
+        private set
+
+    var currentWorkId: UUID? = null
+        private set
+
+    fun clear() {
+        // remove observers
+        observers.forEach { (id, obs) ->
+            val live = workManager.getWorkInfoByIdLiveData(id)
+            live.removeObserver(obs)
+        }
+        observers.clear()
+        _parts.clear()
+        overallPercent = 0
+        currentWorkId = null
+    }
+
+    fun startMonitoring(workId: UUID, totalParts: Int) {
+        // clear previous
+        clear()
+        currentWorkId = workId
+
+        // initialize parts
+        for (i in 0 until totalParts) {
+            _parts.add(PartState(index = i))
+        }
+
+        // observer
+        val live = workManager.getWorkInfoByIdLiveData(workId)
+        val obs = androidx.lifecycle.Observer<WorkInfo> { info ->
+            if (info == null) return@Observer
+            // Overall percent
+            val progressData = info.progress
+            val overall = progressData.getInt("overall_percent", -1)
+            if (overall >= 0) overallPercent = overall
+
+            val uploadedBytes = progressData.getLong("uploaded_bytes", -1L)
+            val totalBytes = progressData.getLong("total_bytes", -1L)
+            if (uploadedBytes >= 0 && totalBytes > 0 && overall < 0) {
+                // compute fallback
+                overallPercent = ((uploadedBytes.toDouble() / totalBytes.toDouble()) * 100).toInt()
+            }
+
+            // part-level
+            val partIndex = progressData.getInt("part_index", -1)
+            val partProgress = progressData.getInt("part_progress", -1)
+            val totalPartsReported = progressData.getInt("total_parts", -1)
+            // Some workers may report "total_parts_for_file" or other keys; we rely on provided totalParts param above
+
+            if (partIndex >= 0 && partIndex < _parts.size) {
+                // update part progress
+                val p = _parts[partIndex]
+                if (partProgress >= 0) {
+                    p.progress = partProgress
+                    p.uploaded = (partProgress >= 100)
+                } else if (info.state.isFinished && p.progress < 100) {
+                    p.progress = 100
+                    p.uploaded = true
+                }
+            }
+
+            // if worker finished, mark remaining parts as uploaded if success
+            if (info.state.isFinished) {
+                if (info.state == WorkInfo.State.SUCCEEDED) {
+                    _parts.forEach { part ->
+                        if (!part.uploaded) {
+                            part.progress = 100
+                            part.uploaded = true
+                        }
+                    }
+                    overallPercent = 100
+                } else {
+                    // mark any in-progress as error
+                    _parts.forEach { part ->
+                        if (!part.uploaded) part.error = true
+                    }
+                }
+            }
+        }
+
+        observers[workId] = obs
+        live.observeForever(obs)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+class MainActivity : ComponentActivity() {
     private val serverBaseNoApi = "https://inspection-sister-wondering-ask.trycloudflare.com"
     private val serverBaseApi = "$serverBaseNoApi/api"
 
+    private lateinit var viewModelFactory: ViewModelProvider.Factory
+    private val uploadMonitor: UploadMonitorViewModel by viewModels {
+        viewModelFactory
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        viewModelFactory = ViewModelProvider.AndroidViewModelFactory.getInstance(application)
+
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    UploadScreen(
-                        initialToken = SessionManager.getToken(applicationContext),
-                        onVerifyToken = { token, onResult ->
-                            verifyToken(token, onResult)
+                    MainScreen(
+                        onVerifyToken = { token, onResult -> verifyToken(token, onResult) },
+                        onStartFFmpegAndUpload = { fileUri, token, customName, description, portadaUri ->
+                            startFFmpegThenUpload(fileUri, token, customName, description, portadaUri)
                         },
-                        onUploadRequested = { videoUri, isFolder, folderUri, token, customName, description, portadaUri ->
-                            startUploadChain(videoUri, isFolder, folderUri, token, customName, description, portadaUri)
-                        }
+                        uploadMonitor = uploadMonitor
                     )
                 }
             }
@@ -79,187 +197,220 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startUploadChain(
-        videoUri: Uri?,
-        isFolder: Boolean,
-        folderUri: Uri?,
-        token: String,
-        customName: String,
-        description: String,
-        portadaUri: Uri?
-    ) {
+    private fun startFFmpegThenUpload(fileUri: Uri, token: String, customName: String, description: String, portadaUri: Uri?) {
         val workManager = WorkManager.getInstance(applicationContext)
+        // 1) enqueue FFmpegWorker
+        val ffmpegInput = Data.Builder()
+            .putString("FILE_URI", fileUri.toString())
+            .putString("TOKEN", token)
+            .putInt("SEG_SECONDS", 120)
+            .build()
 
-        if (isFolder) {
-            val input = Data.Builder()
-                .putString("FOLDER_URI", folderUri?.toString() ?: "")
-                .putString("TOKEN", token)
-                .putString("CUSTOM_NAME", if (customName.isBlank()) "folder_${System.currentTimeMillis()}" else customName)
-                .putString("DESCRIPTION", description)
-                .putString("PORTADA_URI", portadaUri?.toString() ?: "")
-                .build()
+        val ffmpegWork = OneTimeWorkRequestBuilder<FFmpegWorker>()
+            .setInputData(ffmpegInput)
+            .build()
 
-            val folderWork = OneTimeWorkRequestBuilder<FolderUploadWorker>().setInputData(input).build()
-            workManager.enqueue(folderWork)
-        } else {
-            if (videoUri == null) {
-                Toast.makeText(this, "No video selected", Toast.LENGTH_SHORT).show()
-                return
-            }
-            val ffmpegInput = Data.Builder()
-                .putString("FILE_URI", videoUri.toString())
-                .putString("TOKEN", token)
-                .putInt("SEG_SECONDS", 120)
-                .build()
+        workManager.enqueue(ffmpegWork)
 
-            val ffmpegWork = OneTimeWorkRequestBuilder<FFmpegWorker>()
-                .setInputData(ffmpegInput)
-                .build()
-
-            workManager.enqueue(ffmpegWork)
-
-            workManager.getWorkInfoByIdLiveData(ffmpegWork.id).observe(this) { info ->
-                if (info != null && info.state.isFinished) {
-                    if (info.state == WorkInfo.State.SUCCEEDED) {
-                        val outputDir = info.outputData.getString("OUTPUT_DIR")
-                        val outToken = info.outputData.getString("TOKEN") ?: token
-                        if (outputDir.isNullOrEmpty()) {
-                            Toast.makeText(this, "FFmpeg: no segments", Toast.LENGTH_LONG).show()
-                            return@observe
-                        }
-                        val uploadInput = Data.Builder()
-                            .putString("OUTPUT_DIR", outputDir)
-                            .putString("TOKEN", outToken)
-                            .putString("CUSTOM_NAME", if (customName.isBlank()) (videoUri.lastPathSegment ?: "video_${System.currentTimeMillis()}.mp4") else customName)
-                            .putString("DESCRIPTION", description)
-                            .putString("PORTADA_URI", portadaUri?.toString() ?: "")
-                            .build()
-
-                        val uploadWork = OneTimeWorkRequestBuilder<UploadWorker>()
-                            .setInputData(uploadInput)
-                            .build()
-
-                        workManager.enqueue(uploadWork)
-                    } else {
-                        Toast.makeText(this, "FFmpeg failed", Toast.LENGTH_SHORT).show()
+        // observe ffmpeg completion
+        workManager.getWorkInfoByIdLiveData(ffmpegWork.id).observe(this) { info ->
+            if (info != null && info.state.isFinished) {
+                if (info.state == WorkInfo.State.SUCCEEDED) {
+                    val outputDir = info.outputData.getString("OUTPUT_DIR")
+                    val outToken = info.outputData.getString("TOKEN") ?: token
+                    if (outputDir.isNullOrEmpty()) {
+                        Toast.makeText(this, "FFmpeg: no segments", Toast.LENGTH_LONG).show()
+                        return@observe
                     }
+                    // count .ts parts
+                    val dir = File(outputDir)
+                    val tsFiles = dir.listFiles { f -> f.name.endsWith(".ts") }?.sortedBy { it.name } ?: emptyList()
+                    val totalParts = tsFiles.size.coerceAtLeast(1)
+
+                    // Build upload input (use provided customName EXACTLY if present; else use original URi lastPathSegment)
+                    val finalName = if (customName.trim().isEmpty()) {
+                        fileUri.lastPathSegment ?: "video_${System.currentTimeMillis()}"
+                    } else customName.trim()
+
+                    val uploadInput = Data.Builder()
+                        .putString("OUTPUT_DIR", outputDir)
+                        .putString("TOKEN", outToken)
+                        .putString("CUSTOM_NAME", finalName)
+                        .putString("DESCRIPTION", description)
+                        .putString("PORTADA_URI", portadaUri?.toString() ?: "")
+                        .build()
+
+                    val uploadWork = OneTimeWorkRequestBuilder<UploadWorker>()
+                        .setInputData(uploadInput)
+                        .build()
+
+                    workManager.enqueue(uploadWork)
+
+                    // start monitoring progress in ViewModel
+                    uploadMonitor.startMonitoring(uploadWork.id, totalParts)
+
+                } else {
+                    Toast.makeText(this, "FFmpeg failed", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun UploadScreen(
-    initialToken: String,
+fun MainScreen(
     onVerifyToken: (String, (Boolean, String) -> Unit) -> Unit,
-    onUploadRequested: (Uri?, Boolean, Uri?, String, String, String, Uri?) -> Unit
+    onStartFFmpegAndUpload: (Uri, String, String, String, Uri?) -> Unit,
+    uploadMonitor: UploadMonitorViewModel
 ) {
-    var token by remember { mutableStateOf(initialToken) }
+    val ctx = LocalContext.current
+    var token by remember { mutableStateOf(SessionManager.getToken(ctx)) }
     var tokenVerifiedName by remember { mutableStateOf<String?>(null) }
     var selectedVideoUri by remember { mutableStateOf<Uri?>(null) }
-    var selectedFolderUri by remember { mutableStateOf<Uri?>(null) }
     var selectedPortadaUri by remember { mutableStateOf<Uri?>(null) }
     var customName by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
-    var modeIsFolder by remember { mutableStateOf(false) }
 
-    val ctx = LocalContext.current
+    val filePickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? -> selectedVideoUri = uri }
+    val imagePickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? -> selectedPortadaUri = uri }
 
-    val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? -> selectedVideoUri = uri }
+    Column(modifier = Modifier
+        .fillMaxSize()
+        .padding(16.dp)) {
+        Text("DIME - Subidor", style = MaterialTheme.typography.headlineSmall)
+        Spacer(Modifier.height(8.dp))
 
-    val folderPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { uri: Uri? -> selectedFolderUri = uri }
-
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? -> selectedPortadaUri = uri }
-
-    Column(modifier = Modifier.padding(16.dp).fillMaxSize()) {
-        Text(text = "DIME - FFmpeg Segmenter (Android)", style = MaterialTheme.typography.headlineSmall)
-        Spacer(modifier = Modifier.height(12.dp))
-
-        OutlinedTextField(value = token, onValueChange = { token = it }, label = { Text("Token de Acceso") }, modifier = Modifier.fillMaxWidth())
-        Spacer(modifier = Modifier.height(8.dp))
-
+        OutlinedTextField(value = token, onValueChange = { token = it }, label = { Text("Token") }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(8.dp))
         Row {
             Button(onClick = {
                 onVerifyToken(token) { ok, info ->
-                    if (ok) tokenVerifiedName = info else tokenVerifiedName = null
+                    if (ok) {
+                        tokenVerifiedName = info
+                        SessionManager.saveToken(ctx, token)
+                    } else {
+                        tokenVerifiedName = null
+                        Toast.makeText(ctx, "Token inválido", Toast.LENGTH_SHORT).show()
+                    }
                 }
-            }) { Text("✅ Verificar token") }
-            Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { token = ""; tokenVerifiedName = null; SessionManager.clearToken(ctx) }) { Text("🚪 Cerrar sesión") }
+            }) { Text("Verificar") }
+            Spacer(Modifier.width(8.dp))
+            Button(onClick = {
+                token = ""
+                tokenVerifiedName = null
+                SessionManager.clearToken(ctx)
+            }) { Text("Cerrar sesión") }
         }
-
         tokenVerifiedName?.let {
-            Spacer(modifier = Modifier.height(6.dp))
-            Text("Conectado como: $it", color = MaterialTheme.colorScheme.primary)
+            Text("Conectado: $it", color = MaterialTheme.colorScheme.primary)
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Row {
-            Text("Modo:")
-            Spacer(modifier = Modifier.width(8.dp))
-            FilterChip(
-                selected = !modeIsFolder,
-                onClick = { modeIsFolder = false },
-                label = { Text("Video (FFmpeg)") }
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            FilterChip(
-                selected = modeIsFolder,
-                onClick = { modeIsFolder = true },
-                label = { Text("Carpeta") }
-            )
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
+        Spacer(Modifier.height(12.dp))
         OutlinedTextField(value = customName, onValueChange = { customName = it }, label = { Text("Nombre a mostrar (opcional)") }, modifier = Modifier.fillMaxWidth())
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(Modifier.height(8.dp))
         OutlinedTextField(value = description, onValueChange = { description = it }, label = { Text("Descripción (opcional)") }, modifier = Modifier.fillMaxWidth())
-        Spacer(modifier = Modifier.height(12.dp))
 
-        if (!modeIsFolder) {
-            Button(onClick = { filePickerLauncher.launch("video/*") }, modifier = Modifier.fillMaxWidth()) {
-                Text(if (selectedVideoUri == null) "Seleccionar Video Original" else "Video seleccionado")
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = { filePickerLauncher.launch("video/*") }, modifier = Modifier.weight(1f)) {
+                Text(if (selectedVideoUri == null) "Seleccionar video" else "Video seleccionado")
             }
-        } else {
-            Button(onClick = { folderPickerLauncher.launch(null) }, modifier = Modifier.fillMaxWidth()) {
-                Text(if (selectedFolderUri == null) "Seleccionar Carpeta" else "Carpeta seleccionada")
+            Spacer(Modifier.width(8.dp))
+            Button(onClick = { imagePickerLauncher.launch("image/*") }, modifier = Modifier.weight(1f)) {
+                Text(if (selectedPortadaUri == null) "Seleccionar portada" else "Portada seleccionada")
             }
         }
-        Spacer(modifier = Modifier.height(8.dp))
 
-        Button(onClick = { imagePickerLauncher.launch("image/*") }, modifier = Modifier.fillMaxWidth()) {
-            Text(if (selectedPortadaUri == null) "Seleccionar Portada (opcional)" else "Portada seleccionada")
+        Spacer(Modifier.height(16.dp))
+
+        // Progress overview
+        Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(8.dp)) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val overall = uploadMonitor.overallPercent
+                    CircularProgressIndicator(progress = (overall.coerceIn(0,100))/100f, modifier = Modifier.size(56.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text("Progreso global", style = MaterialTheme.typography.titleMedium)
+                        Text("$overall%", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // Grid of parts
+                val parts = uploadMonitor.parts
+                if (parts.isEmpty()) {
+                    Text("No hay subidas activas", color = Color.Gray)
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(4),
+                        modifier = Modifier
+                            .heightIn(min = 120.dp, max = 400.dp)
+                            .fillMaxWidth(),
+                        contentPadding = PaddingValues(4.dp)
+                    ) {
+                        itemsIndexed(parts) { _, part ->
+                            PartBox(part = part)
+                        }
+                    }
+                }
+            }
         }
-        Spacer(modifier = Modifier.height(12.dp))
+
+        Spacer(Modifier.height(12.dp))
 
         Button(
             onClick = {
-                if (modeIsFolder) {
-                    if (selectedFolderUri == null || token.isBlank()) return@Button
-                    onUploadRequested(null, true, selectedFolderUri, token, customName, description, selectedPortadaUri)
-                } else {
-                    if (selectedVideoUri == null || token.isBlank()) return@Button
-                    onUploadRequested(selectedVideoUri, false, null, token, customName, description, selectedPortadaUri)
+                if (selectedVideoUri == null || token.isBlank()) {
+                    Toast.makeText(ctx, "Selecciona video y token", Toast.LENGTH_SHORT).show()
+                    return@Button
                 }
+                // start FFmpeg + upload; uses exact customName semantics already described
+                onStartFFmpegAndUpload(selectedVideoUri!!, token, customName, description, selectedPortadaUri)
             },
-            enabled = ((modeIsFolder && selectedFolderUri != null) || (!modeIsFolder && selectedVideoUri != null)) && token.isNotBlank(),
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Procesar y Subir")
         }
+    }
+}
 
-        Spacer(modifier = Modifier.height(18.dp))
-
-        Text("La app segmenta (FFmpeg) y sube partes. Ver detalles en notificaciones o logs.")
+@Composable
+fun PartBox(part: PartState) {
+    val bgColor = when {
+        part.error -> Color(0xFFD9534F) // red
+        part.uploaded -> Color(0xFF28A745) // green
+        part.progress > 0 -> Color(0xFF2A9DF4) // blue
+        else -> Color(0xFF3A3A3A) // dark gray
+    }
+    Card(
+        modifier = Modifier
+            .padding(6.dp)
+            .height(56.dp)
+            .fillMaxWidth(),
+        shape = RoundedCornerShape(6.dp)
+    ) {
+        Row(modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF121212))
+            .padding(6.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Box(modifier = Modifier
+                .size(36.dp)
+                .background(bgColor, shape = RoundedCornerShape(4.dp)),
+                contentAlignment = Alignment.Center) {
+                Text("${part.index+1}", color = Color.White, textAlign = TextAlign.Center)
+            }
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text("Parte ${part.index+1}", style = MaterialTheme.typography.bodyMedium)
+                LinearProgressIndicator(progress = (part.progress.coerceIn(0,100))/100f, modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp))
+            }
+            Spacer(Modifier.width(8.dp))
+            Text("${part.progress}%", modifier = Modifier.width(40.dp), textAlign = TextAlign.Center)
+        }
     }
 }
