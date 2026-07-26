@@ -72,6 +72,9 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
                     continue
                 }
 
+                // Log exact payload details before sending (helps debugging/comparison with Python client)
+                Log.i(TAG, "Uploading chunk -> upload_id=$uploadId filename=$customName chunkIndex=$index partFile=${file.name}")
+
                 // set part start
                 setProgress(workDataOf("part_index" to index, "part_progress" to 0, "total_parts" to totalChunks))
 
@@ -85,6 +88,9 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
                         if (!ok2) {
                             outputDir.deleteRecursively()
                             return Result.retry()
+                        } else {
+                            // update customName to alt for subsequent parts and finalization
+                            customName = alt
                         }
                     } else {
                         outputDir.deleteRecursively()
@@ -184,7 +190,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
     /**
      * Upload a single .ts part, matching Python client exactly:
      * - form fields: upload_id, filename (CUSTOM_NAME), chunk_index, total_chunks
-     * - file part: name "chunk", filename = partFile.name, content-type "video/MP2T"
+     * - file part: field 'chunk', filename = partFile.name, content-type 'video/MP2T'
      */
     private fun uploadTsChunk(uploadId: String, token: String, chunkIndex: Int, totalChunks: Int, file: File, filenameForServer: String): Boolean {
         val multipartBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -192,7 +198,6 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         multipartBuilder.addFormDataPart("filename", filenameForServer)
         multipartBuilder.addFormDataPart("chunk_index", chunkIndex.toString())
         multipartBuilder.addFormDataPart("total_chunks", totalChunks.toString())
-        // file part: field 'chunk', filename = actual part file name (like Python)
         multipartBuilder.addFormDataPart("chunk", file.name, file.asRequestBody("video/MP2T".toMediaTypeOrNull()))
 
         val request = Request.Builder()
