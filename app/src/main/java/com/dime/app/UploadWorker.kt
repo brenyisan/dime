@@ -86,7 +86,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         val tsFiles = outputDir.listFiles { f -> f.name.endsWith(".ts") }?.sortedBy { it.name } ?: emptyList()
         if (tsFiles.isEmpty()) return Result.failure()
 
-        // upload portada first if present
+        // 1) upload portada (if any) and get saved name (no prefixes)
         var portadaSavedAs: String? = null
         if (portadaUriStr.isNotBlank()) {
             val portadaFile = UriUtils.uriToTempFile(applicationContext, portadaUriStr)
@@ -98,6 +98,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
             }
         }
 
+        // 2) upload parts (single upload_id for this video)
         val uploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
         val totalChunks = tsFiles.size
         var bytesUploaded = 0L
@@ -109,24 +110,26 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
             for ((index, file) in tsFiles.withIndex()) {
                 if (already.contains(index)) {
                     bytesUploaded += file.length()
-                    runBlocking { setProgress(workDataOf(
-                        "uploaded_bytes" to bytesUploaded,
-                        "total_bytes" to totalBytes,
-                        "part_index" to index,
-                        "part_progress" to 100,
-                        "total_parts" to totalChunks
-                    )) }
+                    runBlocking {
+                        setProgress(workDataOf(
+                            "uploaded_bytes" to bytesUploaded,
+                            "total_bytes" to totalBytes,
+                            "part_index" to index,
+                            "part_progress" to 100,
+                            "total_parts" to totalChunks
+                        ))
+                    }
                     continue
                 }
 
                 Log.i(TAG, "Uploading chunk -> upload_id=$uploadId filename=$customName chunkIndex=$index partFile=${file.name}")
 
-                // set part start
+                // notify start
                 runBlocking { setProgress(workDataOf("part_index" to index, "part_progress" to 0, "total_parts" to totalChunks)) }
 
                 val success = uploadTsChunkWithProgress(uploadId, token, index, totalChunks, file, customName)
                 if (!success) {
-                    // retry with .mp4 appended if missing extension
+                    // retry with .mp4 appended if missing extension (tolerance)
                     if (!customName.contains('.')) {
                         val alt = "$customName.mp4"
                         Log.i(TAG, "Retry upload with alt filename: $alt")
@@ -155,18 +158,21 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
                 )) }
             }
 
-            // finalize
+            // 3) finalize: include assignments like Python client expects
             val assignmentsObj = JSONObject()
             val assignArr = JSONArray()
+
             if (!portadaSavedAs.isNullOrBlank()) {
                 val a = JSONObject()
                 a.put("video", customName)
-                a.put("image", "existing:${portadaSavedAs}")
+                // IMPORTANT: pass saved filename exactly as returned by /api/upload (no "existing:" prefix)
+                a.put("image", portadaSavedAs)
                 a.put("descripcion", description)
                 assignArr.put(a)
             }
+
             assignmentsObj.put("assignments", assignArr)
-            assignmentsObj.put("container_portadas", JSONObject())
+            assignmentsObj.put("container_portadas", JSONObject()) // keep empty (video mode uses assignments array)
             val descs = JSONObject()
             if (description.isNotBlank()) descs.put(customName, description)
             assignmentsObj.put("descriptions", descs)
@@ -230,6 +236,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
                 val details = jo.optJSONArray("details")
                 if (details != null && details.length() > 0) {
                     val d0 = details.getJSONObject(0)
+                    // Return saved filename exactly
                     return d0.optString("saved_as", null)
                 }
             } catch (e: Exception) {
@@ -243,10 +250,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         val fileReq = file.asRequestBody("video/mp2t".toMediaTypeOrNull())
         val counting = CountingRequestBody(fileReq) { written, total ->
             val pct = if (total > 0) ((written * 100.0) / total).toInt() else 0
-            // setProgress is suspend; call from non-suspend via runBlocking
-            runBlocking {
-                setProgress(workDataOf("part_index" to chunkIndex, "part_progress" to pct, "total_parts" to totalChunks))
-            }
+            runBlocking { setProgress(workDataOf("part_index" to chunkIndex, "part_progress" to pct, "total_parts" to totalChunks)) }
         }
 
         val multipartBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
