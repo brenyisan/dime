@@ -31,9 +31,14 @@ class UploadWorker(appContext: Context, workerParams: WorkerParameters) :
     override suspend fun doWork(): Result {
         val outputDirStr = inputData.getString("OUTPUT_DIR") ?: return Result.failure()
         val token = inputData.getString("TOKEN") ?: return Result.failure()
-        val customName = inputData.getString("CUSTOM_NAME") ?: "Video_Mobile_${System.currentTimeMillis()}.mp4"
+        var customName = inputData.getString("CUSTOM_NAME") ?: ""
         val description = inputData.getString("DESCRIPTION") ?: ""
         val portadaUriStr = inputData.getString("PORTADA_URI") ?: ""
+
+        // Normalize custom name and ensure extension
+        customName = customName.trim()
+        if (customName.isEmpty()) customName = "Video_Mobile_${System.currentTimeMillis()}.mp4"
+        customName = UriUtils.ensureHasExtension(customName, ".mp4")
 
         val outputDir = File(outputDirStr)
         if (!outputDir.exists() || !outputDir.isDirectory) return Result.failure()
