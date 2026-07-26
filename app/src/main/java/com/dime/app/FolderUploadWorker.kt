@@ -5,14 +5,16 @@ import androidx.documentfile.provider.DocumentFile
 import androidx.work.CoroutineWorker
 import androidx.work.Data
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.runBlocking
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import okio.Buffer
 import okio.ForwardingSink
 import okio.Okio
-import okio.Sink
+import okio.buffer
+import okio.source
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -36,7 +38,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         return "$server/api"
     }
 
-    // CountingRequestBody same approach to report progress while writing bytes
+    // CountingRequestBody for byte[] source
     class CountingRequestBody(
         private val delegateLength: Long,
         private val sourceProvider: () -> okio.Source,
@@ -55,8 +57,7 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
                     onProgress(bytesWritten, total)
                 }
             }
-            val buffered = Okio.buffer(countingSink)
-            // write the provided source into buffered sink
+            val buffered = countingSink.buffer()
             val src = sourceProvider()
             try {
                 var read: Long
@@ -97,10 +98,6 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
 
         try {
             val manifestArr = JSONArray()
-            var totalBytesAll = 0L
-            for ((_, rel) in files) {
-                // estimate (we don't have sizes here) - optional
-            }
 
             for ((doc, relPath) in files) {
                 val rel = relPath.trim()
@@ -123,13 +120,13 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
                         val bytes = if (read == buf.size) buf else buf.copyOf(read)
 
                         // Report progress start for this chunk
-                        setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 0).putInt("total_parts_for_file", totalChunks).build())
+                        runBlocking { setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 0).putInt("total_parts_for_file", totalChunks).build()) }
 
                         val ok = uploadChunkBytesWithProgress(uploadId, token, rel, idx, totalChunks, bytes)
                         if (!ok) return Result.retry()
 
                         // Report finished chunk
-                        setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 100).putInt("total_parts_for_file", totalChunks).build())
+                        runBlocking { setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 100).putInt("total_parts_for_file", totalChunks).build()) }
                         idx++
                     }
                 }
@@ -220,14 +217,14 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
 
     private fun uploadChunkBytesWithProgress(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
         val total = bytes.size.toLong()
-        val sourceProvider = { Okio.source(bytes.inputStream()) }
+        val sourceProvider = { bytes.inputStream().source() }
         val counting = CountingRequestBody(
             delegateLength = total,
             sourceProvider = sourceProvider,
             contentType = "application/octet-stream".toMediaTypeOrNull(),
             onProgress = { written, contentLen ->
                 val pct = if (contentLen > 0) ((written * 100.0) / contentLen).toInt() else 0
-                setProgress(Data.Builder().putInt("part_index", chunkIndex).putInt("part_progress", pct).putInt("total_parts_for_file", totalChunks).build())
+                runBlocking { setProgress(Data.Builder().putInt("part_index", chunkIndex).putInt("part_progress", pct).putInt("total_parts_for_file", totalChunks).build()) }
             }
         )
 
