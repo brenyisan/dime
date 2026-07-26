@@ -2,6 +2,7 @@ package com.dime.app
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import androidx.work.CoroutineWorker
 import androidx.work.Data
@@ -20,6 +21,7 @@ import kotlin.math.ceil
 class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
     CoroutineWorker(appContext, workerParams) {
 
+    private val TAG = "FolderUploadWorker"
     private val client = OkHttpClient.Builder()
         .connectTimeout(180, TimeUnit.SECONDS)
         .writeTimeout(180, TimeUnit.SECONDS)
@@ -77,9 +79,15 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                             continue
                         }
                         val bytes = if (read == buf.size) buf else buf.copyOf(read)
-                        val ok = uploadChunkBytes(uploadId, token, rel, idx, totalChunks, bytes)
+
+                        // Report progress start for this chunk
+                        setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 0).putInt("total_parts_for_file", totalChunks).build())
+
+                        val ok = uploadChunkBytesWithRecovery(uploadId, token, rel, idx, totalChunks, bytes)
                         if (!ok) return Result.retry()
-                        setProgress(Data.Builder().putInt("part_index", idx).putInt("total_parts_for_file", totalChunks).build())
+
+                        // Report finished chunk
+                        setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 100).putInt("total_parts_for_file", totalChunks).build())
                         idx++
                     }
                 }
@@ -118,9 +126,15 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                 .build()
 
             client.newCall(req).execute().use { resp ->
-                return if (resp.isSuccessful) Result.success() else Result.retry()
+                val body = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "finalize failed: ${resp.code} - $body")
+                    return Result.retry()
+                }
+                return Result.success()
             }
         } catch (e: Exception) {
+            Log.e(TAG, "doWork failed", e)
             e.printStackTrace()
             return Result.failure()
         }
@@ -158,8 +172,22 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                 return set
             }
         } catch (e: Exception) {
+            Log.w(TAG, "queryReceivedChunks error", e)
             return emptySet()
         }
+    }
+
+    private fun uploadChunkBytesWithRecovery(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
+        val ok = uploadChunkBytes(uploadId, token, filename, chunkIndex, totalChunks, bytes)
+        if (ok) return true
+
+        // If filename lacks dot/extension, try with .mp4 appended
+        if (!filename.contains('.')) {
+            val alt = "$filename.mp4"
+            Log.i(TAG, "Retrying chunk with alt filename: $alt")
+            return uploadChunkBytes(uploadId, token, alt, chunkIndex, totalChunks, bytes)
+        }
+        return false
     }
 
     private fun uploadChunkBytes(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
@@ -168,6 +196,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         multipart.addFormDataPart("filename", filename)
         multipart.addFormDataPart("chunk_index", chunkIndex.toString())
         multipart.addFormDataPart("total_chunks", totalChunks.toString())
+        // field name "chunk", filename "chunk" (server-compatible) and bytes body
         multipart.addFormDataPart("chunk", "chunk", bytes.toRequestBody("application/octet-stream".toMediaTypeOrNull()))
 
         val req = Request.Builder()
@@ -177,7 +206,13 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
             .build()
 
         client.newCall(req).execute().use { resp ->
-            return resp.isSuccessful
+            val body = resp.body?.string().orEmpty()
+            if (resp.isSuccessful) {
+                return true
+            } else {
+                Log.w(TAG, "uploadChunkBytes failed code=${resp.code} filename=$filename chunkIndex=$chunkIndex body=$body")
+                return false
+            }
         }
     }
 
@@ -191,7 +226,10 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         val request = Request.Builder().url("${baseApi()}/upload").addHeader("x-upload-token", token).post(multipart.build()).build()
         client.newCall(request).execute().use { resp ->
             val bodyStr = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) return null
+            if (!resp.isSuccessful) {
+                Log.w(TAG, "uploadPortadaFile failed: ${resp.code} - $bodyStr")
+                return null
+            }
             try {
                 val jo = JSONObject(bodyStr)
                 val details = jo.optJSONArray("details")
@@ -199,7 +237,9 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                     val d0 = details.getJSONObject(0)
                     return d0.optString("saved_as", null)
                 }
-            } catch (e: Exception) { e.printStackTrace() }
+            } catch (e: Exception) {
+                Log.w(TAG, "uploadPortadaFile parse error", e)
+            }
             return null
         }
     }
