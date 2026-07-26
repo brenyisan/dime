@@ -1,7 +1,5 @@
 package com.dime.app
 
-import android.content.Context
-import android.net.Uri
 import android.util.Log
 import androidx.documentfile.provider.DocumentFile
 import androidx.work.CoroutineWorker
@@ -11,15 +9,17 @@ import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.RequestBody.Companion.asRequestBody
+import okio.Buffer
+import okio.ForwardingSink
+import okio.Okio
+import okio.Sink
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
 
-class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
+class FolderUploadWorker(appContext: android.content.Context, workerParams: WorkerParameters) :
     CoroutineWorker(appContext, workerParams) {
 
     private val TAG = "FolderUploadWorker"
@@ -36,6 +36,41 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         return "$server/api"
     }
 
+    // CountingRequestBody same approach to report progress while writing bytes
+    class CountingRequestBody(
+        private val delegateLength: Long,
+        private val sourceProvider: () -> okio.Source,
+        private val contentType: MediaType?,
+        private val onProgress: (bytesWritten: Long, contentLength: Long) -> Unit
+    ) : RequestBody() {
+        override fun contentType(): MediaType? = contentType
+        override fun contentLength(): Long = delegateLength
+        override fun writeTo(sink: okio.BufferedSink) {
+            val countingSink = object : ForwardingSink(sink) {
+                var bytesWritten = 0L
+                val total = contentLength()
+                override fun write(source: Buffer, byteCount: Long) {
+                    super.write(source, byteCount)
+                    bytesWritten += byteCount
+                    onProgress(bytesWritten, total)
+                }
+            }
+            val buffered = Okio.buffer(countingSink)
+            // write the provided source into buffered sink
+            val src = sourceProvider()
+            try {
+                var read: Long
+                val buf = Buffer()
+                while (src.read(buf, 8192).also { read = it } != -1L) {
+                    buffered.write(buf, read)
+                }
+            } finally {
+                src.close()
+            }
+            buffered.flush()
+        }
+    }
+
     override suspend fun doWork(): Result {
         val folderUriStr = inputData.getString("FOLDER_URI") ?: return Result.failure()
         val token = inputData.getString("TOKEN") ?: return Result.failure()
@@ -44,7 +79,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         val portadaUriStr = inputData.getString("PORTADA_URI") ?: ""
 
         val ctx = applicationContext
-        val tree = Uri.parse(folderUriStr)
+        val tree = android.net.Uri.parse(folderUriStr)
         val docFile = DocumentFile.fromTreeUri(ctx, tree) ?: return Result.failure()
 
         val files = mutableListOf<Pair<DocumentFile, String>>()
@@ -56,11 +91,17 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
             val tmp = UriUtils.uriToTempFile(ctx, portadaUriStr)
             if (tmp != null) {
                 portadaSavedAs = uploadPortadaFile(tmp, token)
+                Log.i(TAG, "Portada uploaded saved_as=$portadaSavedAs")
             }
         }
 
         try {
             val manifestArr = JSONArray()
+            var totalBytesAll = 0L
+            for ((_, rel) in files) {
+                // estimate (we don't have sizes here) - optional
+            }
+
             for ((doc, relPath) in files) {
                 val rel = relPath.trim()
                 val size = doc.length()
@@ -84,7 +125,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                         // Report progress start for this chunk
                         setProgress(Data.Builder().putInt("part_index", idx).putInt("part_progress", 0).putInt("total_parts_for_file", totalChunks).build())
 
-                        val ok = uploadChunkBytesWithRecovery(uploadId, token, rel, idx, totalChunks, bytes)
+                        val ok = uploadChunkBytesWithProgress(uploadId, token, rel, idx, totalChunks, bytes)
                         if (!ok) return Result.retry()
 
                         // Report finished chunk
@@ -136,7 +177,6 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
             }
         } catch (e: Exception) {
             Log.e(TAG, "doWork failed", e)
-            e.printStackTrace()
             return Result.failure()
         }
     }
@@ -178,27 +218,25 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         }
     }
 
-    private fun uploadChunkBytesWithRecovery(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
-        val ok = uploadChunkBytes(uploadId, token, filename, chunkIndex, totalChunks, bytes)
-        if (ok) return true
+    private fun uploadChunkBytesWithProgress(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
+        val total = bytes.size.toLong()
+        val sourceProvider = { Okio.source(bytes.inputStream()) }
+        val counting = CountingRequestBody(
+            delegateLength = total,
+            sourceProvider = sourceProvider,
+            contentType = "application/octet-stream".toMediaTypeOrNull(),
+            onProgress = { written, contentLen ->
+                val pct = if (contentLen > 0) ((written * 100.0) / contentLen).toInt() else 0
+                setProgress(Data.Builder().putInt("part_index", chunkIndex).putInt("part_progress", pct).putInt("total_parts_for_file", totalChunks).build())
+            }
+        )
 
-        // If filename lacks dot/extension, try with .mp4 appended
-        if (!filename.contains('.')) {
-            val alt = "$filename.mp4"
-            Log.i(TAG, "Retrying chunk with alt filename: $alt")
-            return uploadChunkBytes(uploadId, token, alt, chunkIndex, totalChunks, bytes)
-        }
-        return false
-    }
-
-    private fun uploadChunkBytes(uploadId: String, token: String, filename: String, chunkIndex: Int, totalChunks: Int, bytes: ByteArray): Boolean {
         val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
         multipart.addFormDataPart("upload_id", uploadId)
         multipart.addFormDataPart("filename", filename)
         multipart.addFormDataPart("chunk_index", chunkIndex.toString())
         multipart.addFormDataPart("total_chunks", totalChunks.toString())
-        // file part: field "chunk", filename "chunk", body bytes
-        multipart.addFormDataPart("chunk", "chunk", bytes.toRequestBody("application/octet-stream".toMediaTypeOrNull()))
+        multipart.addFormDataPart("chunk", "chunk", counting)
 
         val req = Request.Builder()
             .url("${baseApi()}/upload/chunk")
@@ -217,7 +255,7 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         }
     }
 
-    private fun uploadPortadaFile(file: File, token: String): String? {
+    private fun uploadPortadaFile(file: java.io.File, token: String): String? {
         val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
         multipart.addFormDataPart("carpeta", "")
         multipart.addFormDataPart("portada_mode", "container")
