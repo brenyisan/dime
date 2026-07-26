@@ -26,6 +26,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewModelScope
 import androidx.work.*
 import kotlinx.coroutines.Dispatchers
@@ -168,6 +169,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun verifyToken(token: String, onResult: (Boolean, String) -> Unit) {
+        // Use lifecycleScope so withContext calls are inside coroutine
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val client = OkHttpClient.Builder()
