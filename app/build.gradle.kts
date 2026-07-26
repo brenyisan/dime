@@ -29,7 +29,6 @@ android {
     }
 
     composeOptions {
-        // Compose Compiler 1.5.8 requiere Kotlin 1.9.22
         kotlinCompilerExtensionVersion = "1.5.8"
     }
 
@@ -40,6 +39,11 @@ android {
     kotlinOptions {
         jvmTarget = "1.8"
     }
+
+    // Optional: packagingOptions if FFmpeg native libs cause conflicts (tweak if needed)
+    // packagingOptions {
+    //     resources.excludes += setOf("META-INF/DEPENDENCIES", "META-INF/LICENSE", "META-INF/LICENSE.txt")
+    // }
 }
 
 dependencies {
@@ -47,13 +51,24 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.activity:activity-compose:1.8.2")
+    implementation("androidx.activity:activity-ktx:1.8.2")                // for viewModels delegate support
 
+    // Lifecycle / ViewModel
+    implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.6.2")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
+
+    // WorkManager
     implementation("androidx.work:work-runtime-ktx:2.9.0")
+
+    // Networking
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // FFmpeg full GPL como pediste
+    // FFmpeg (Full GPL artifact)
     implementation("com.antonkarpenko:ffmpeg-kit-full-gpl:2.2.1")
 
+    // DocumentFile helper
     implementation("androidx.documentfile:documentfile:1.0.1")
+
+    // Coroutines (Android)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
