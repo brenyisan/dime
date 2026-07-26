@@ -4,14 +4,16 @@ import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import kotlinx.coroutines.runBlocking
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.asRequestBody
 import okio.Buffer
 import okio.ForwardingSink
-import okio.Okio
+import okio.buffer
 import okio.Sink
+import okio.source
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -37,7 +39,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         return "$server/api"
     }
 
-    // Counting wrapper for RequestBody that reports progress
+    // Counting wrapper for RequestBody that reports progress via callback
     class CountingRequestBody(
         private val delegate: RequestBody,
         private val onProgress: (bytesWritten: Long, contentLength: Long) -> Unit
@@ -62,7 +64,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
                     onProgress(bytesWritten, if (total >= 0) total else -1L)
                 }
             }
-            val buffered = Okio.buffer(countingSink)
+            val buffered = countingSink.buffer()
             delegate.writeTo(buffered)
             buffered.flush()
         }
@@ -107,20 +109,20 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
             for ((index, file) in tsFiles.withIndex()) {
                 if (already.contains(index)) {
                     bytesUploaded += file.length()
-                    setProgress(workDataOf(
+                    runBlocking { setProgress(workDataOf(
                         "uploaded_bytes" to bytesUploaded,
                         "total_bytes" to totalBytes,
                         "part_index" to index,
                         "part_progress" to 100,
                         "total_parts" to totalChunks
-                    ))
+                    )) }
                     continue
                 }
 
                 Log.i(TAG, "Uploading chunk -> upload_id=$uploadId filename=$customName chunkIndex=$index partFile=${file.name}")
 
                 // set part start
-                setProgress(workDataOf("part_index" to index, "part_progress" to 0, "total_parts" to totalChunks))
+                runBlocking { setProgress(workDataOf("part_index" to index, "part_progress" to 0, "total_parts" to totalChunks)) }
 
                 val success = uploadTsChunkWithProgress(uploadId, token, index, totalChunks, file, customName)
                 if (!success) {
@@ -143,14 +145,14 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
 
                 bytesUploaded += file.length()
                 val percent = if (totalBytes > 0) ((bytesUploaded.toDouble() / totalBytes) * 100).roundToInt() else 0
-                setProgress(workDataOf(
+                runBlocking { setProgress(workDataOf(
                     "uploaded_bytes" to bytesUploaded,
                     "total_bytes" to totalBytes,
                     "part_index" to index,
                     "part_progress" to 100,
                     "total_parts" to totalChunks,
                     "overall_percent" to percent
-                ))
+                )) }
             }
 
             // finalize
@@ -241,8 +243,10 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         val fileReq = file.asRequestBody("video/mp2t".toMediaTypeOrNull())
         val counting = CountingRequestBody(fileReq) { written, total ->
             val pct = if (total > 0) ((written * 100.0) / total).toInt() else 0
-            // Update part progress live
-            setProgress(workDataOf("part_index" to chunkIndex, "part_progress" to pct, "total_parts" to totalChunks))
+            // setProgress is suspend; call from non-suspend via runBlocking
+            runBlocking {
+                setProgress(workDataOf("part_index" to chunkIndex, "part_progress" to pct, "total_parts" to totalChunks))
+            }
         }
 
         val multipartBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
