@@ -13,11 +13,9 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.InputStream
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
-import kotlin.math.roundToInt
 
 class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
     CoroutineWorker(appContext, workerParams) {
@@ -42,10 +40,9 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
         val tree = Uri.parse(folderUriStr)
         val docFile = DocumentFile.fromTreeUri(ctx, tree) ?: return Result.failure()
 
-        // Collect files recursively (only allowed types: video/img/sub)
-        val files = mutableListOf<Pair<DocumentFile, String>>() // pair<doc, relPath>
-        collectFilesRec(docFile, docFile.name ?: "", files, docFile)
-
+        // Collect files recursively
+        val files = mutableListOf<Pair<DocumentFile, String>>()
+        collectFilesRec(docFile, "", files, docFile)
         if (files.isEmpty()) return Result.failure()
 
         // Upload portada if provided
@@ -57,17 +54,19 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
             }
         }
 
-        // For each file in folder, chunk it and upload parts (resume via chunk/status)
         try {
-            for ((doc, rel) in files) {
+            val manifestArr = JSONArray()
+            for ((doc, relOrig) in files) {
+                val relTrim = relOrig.trim()
+                // Ensure extension for the server validation
+                val filenameForServer = UriUtils.ensureHasExtension(relTrim, ".mp4")
+                // chunk handling
                 val size = doc.length()
                 val totalChunks = ceil(size.toDouble() / CHUNK_SIZE.toDouble()).toInt()
                 val uploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
 
-                // Query server for received chunks
-                val received = queryReceivedChunks(uploadId, rel, token)
+                val received = queryReceivedChunks(uploadId, filenameForServer, token)
 
-                // open input stream and send chunks
                 ctx.contentResolver.openInputStream(doc.uri)?.use { input ->
                     var idx = 0
                     val buf = ByteArray(CHUNK_SIZE)
@@ -79,20 +78,15 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
                             continue
                         }
                         val bytes = if (read == buf.size) buf else buf.copyOf(read)
-                        val ok = uploadChunkBytes(uploadId, token, rel, idx, totalChunks, bytes)
+                        val ok = uploadChunkBytes(uploadId, token, filenameForServer, idx, totalChunks, bytes)
                         if (!ok) return Result.retry()
-                        // progress (we report part progress simple)
                         setProgress(Data.Builder().putInt("part_index", idx).putInt("total_parts_for_file", totalChunks).build())
                         idx++
                     }
                 }
-            }
 
-            // Build manifest list: all filenames relative (we collected in files list)
-            val manifestArr = JSONArray()
-            for ((_, rel) in files) {
                 val o = JSONObject()
-                o.put("filename", rel)
+                o.put("filename", filenameForServer)
                 manifestArr.put(o)
             }
 
@@ -107,7 +101,6 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
             if (description.isNotBlank()) descs.put(customName, description)
             assignmentsObj.put("descriptions", descs)
 
-            // Finalize with parts_kind raw
             val uploadIdForFinalize = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
             val form = FormBody.Builder()
                 .add("upload_id", uploadIdForFinalize)
@@ -136,8 +129,8 @@ class FolderUploadWorker(appContext: Context, workerParams: WorkerParameters) :
 
     private fun collectFilesRec(root: DocumentFile, baseName: String, acc: MutableList<Pair<DocumentFile, String>>, current: DocumentFile) {
         if (current.isFile) {
-            val rel = current.uri.path?.let { current.name } ?: current.name ?: return
-            acc.add(Pair(current, rel))
+            val name = current.name?.trim() ?: return
+            acc.add(Pair(current, name))
         } else if (current.isDirectory) {
             for (c in current.listFiles()) {
                 collectFilesRec(root, baseName, acc, c)
