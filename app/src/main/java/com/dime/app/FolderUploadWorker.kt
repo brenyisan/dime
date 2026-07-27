@@ -87,12 +87,14 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         collectFilesRec(docFile, "", files, docFile)
         if (files.isEmpty()) return Result.failure()
 
-        // upload portada first if provided, get saved filename
+        // upload portada first if provided — igual que el cliente Python: se sube como
+        // un único "chunk" (1 de 1) y luego se finaliza con parts_kind="image".
+        // El nombre se fuerza al nombre de la carpeta/video + ".jpg".
         var portadaSavedAs: String? = null
         if (portadaUriStr.isNotBlank()) {
             val tmp = UriUtils.uriToTempFile(ctx, portadaUriStr)
             if (tmp != null) {
-                portadaSavedAs = uploadPortadaFile(tmp, token)
+                portadaSavedAs = uploadPortadaFile(tmp, token, customName)
                 Log.i(TAG, "Portada uploaded saved_as=$portadaSavedAs")
             }
         }
@@ -256,31 +258,75 @@ class FolderUploadWorker(appContext: android.content.Context, workerParams: Work
         }
     }
 
-    private fun uploadPortadaFile(file: java.io.File, token: String): String? {
-        val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
-        multipart.addFormDataPart("carpeta", "")
-        multipart.addFormDataPart("portada_mode", "container")
-        multipart.addFormDataPart("generate_quick", "0")
-        val mediaType = UriUtils.guessMimeType(file.name) ?: "application/octet-stream"
-        multipart.addFormDataPart("files", file.name, file.asRequestBody(mediaType.toMediaTypeOrNull()))
-        val request = Request.Builder().url("${baseApi()}/upload").addHeader("x-upload-token", token).post(multipart.build()).build()
-        client.newCall(request).execute().use { resp ->
-            val bodyStr = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                Log.w(TAG, "uploadPortadaFile failed: ${resp.code} - $bodyStr")
-                return null
-            }
-            try {
-                val jo = JSONObject(bodyStr)
-                val details = jo.optJSONArray("details")
-                if (details != null && details.length() > 0) {
-                    val d0 = details.getJSONObject(0)
-                    return d0.optString("saved_as", null)
+    /**
+     * Sube la portada EXACTAMENTE igual que el cliente Python (uploader_ffmpeg_gui.py):
+     *  1) Fuerza el nombre a "<customName>.jpg" (extensión .jpg sin excepción).
+     *  2) La envía como un único chunk (chunk_index=0, total_chunks=1) a /api/upload/chunk.
+     *  3) Llama a /api/upload/finalize con parts_kind="image" para que el servidor
+     *     la reconstruya/guarde como imagen final.
+     *
+     * Devuelve el nombre guardado (el mismo "<customName>.jpg" que se envió).
+     */
+    private fun uploadPortadaFile(file: java.io.File, token: String, customName: String): String? {
+        val nuevoNombre = "$customName.jpg"
+        val coverUploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
+
+        // --- Paso 1: subir la imagen completa como chunk único (0 de 1) ---
+        val chunkBody = file.asRequestBody("image/jpeg".toMediaTypeOrNull())
+        val chunkMultipart = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("upload_id", coverUploadId)
+            .addFormDataPart("filename", nuevoNombre)
+            .addFormDataPart("chunk_index", "0")
+            .addFormDataPart("total_chunks", "1")
+            .addFormDataPart("chunk", nuevoNombre, chunkBody)
+            .build()
+
+        val chunkRequest = Request.Builder()
+            .url("${baseApi()}/upload/chunk")
+            .addHeader("x-upload-token", token)
+            .post(chunkMultipart)
+            .build()
+
+        try {
+            client.newCall(chunkRequest).execute().use { resp ->
+                val bodyStr = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "uploadPortadaFile chunk failed: ${resp.code} - $bodyStr")
+                    return null
                 }
-            } catch (e: Exception) {
-                Log.w(TAG, "uploadPortadaFile parse error", e)
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "uploadPortadaFile chunk error", e)
             return null
         }
+
+        // --- Paso 2: finalizar como imagen ---
+        val finalizeForm = FormBody.Builder()
+            .add("upload_id", coverUploadId)
+            .add("carpeta", "")
+            .add("manifest", "[{\"filename\":\"$nuevoNombre\"}]")
+            .add("parts_kind", "image")
+            .build()
+
+        val finalizeRequest = Request.Builder()
+            .url("${baseApi()}/upload/finalize")
+            .addHeader("x-upload-token", token)
+            .post(finalizeForm)
+            .build()
+
+        try {
+            client.newCall(finalizeRequest).execute().use { resp ->
+                val bodyStr = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    Log.w(TAG, "uploadPortadaFile finalize failed: ${resp.code} - $bodyStr")
+                    return null
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "uploadPortadaFile finalize error", e)
+            return null
+        }
+
+        return nuevoNombre
     }
 }
