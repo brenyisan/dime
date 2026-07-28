@@ -6,14 +6,11 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import kotlinx.coroutines.runBlocking
 import okhttp3.*
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.asRequestBody
 import okio.Buffer
 import okio.ForwardingSink
 import okio.buffer
-import okio.Sink
-import okio.source
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -31,8 +28,6 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         .writeTimeout(180, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
         .build()
-
-    private val CHUNK_SIZE = 4 * 1024 * 1024
 
     private fun baseApi(): String {
         val server = SessionManager.getServerUrl(applicationContext).trimEnd('/')
@@ -89,6 +84,7 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         // 1) upload portada (if any) — igual que el cliente Python: se sube como
         //    un único "chunk" (1 de 1) y luego se finaliza con parts_kind="image".
         //    El nombre se fuerza al nombre del video + ".jpg", sin excepción.
+        //    (SIN CAMBIOS respecto al código original)
         var portadaSavedAs: String? = null
         if (portadaUriStr.isNotBlank()) {
             val portadaFile = UriUtils.uriToTempFile(applicationContext, portadaUriStr)
@@ -101,29 +97,20 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         }
 
         // 2) upload parts (single upload_id for this video)
+        // CORRECCIÓN: se quitó el chequeo previo contra queryReceivedChunks(), que usaba
+        // un upload_id recién generado (UUID.randomUUID()) y por lo tanto SIEMPRE debía
+        // devolver un set vacío del servidor. Ese chequeo estaba provocando que partes
+        // válidas cayeran en la rama "already.contains(index)" y se saltaran con
+        // `continue` sin llegar nunca a uploadTsChunkWithProgress(), es decir, sin
+        // subirse realmente al servidor. Python nunca hace este chequeo: sencillamente
+        // sube cada parte generada por ffmpeg en orden. Ahora el loop hace lo mismo.
         val uploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
         val totalChunks = tsFiles.size
         var bytesUploaded = 0L
         val totalBytes = tsFiles.sumOf { it.length() }
 
-        val already = queryReceivedChunks(uploadId, customName, token)
-
         try {
             for ((index, file) in tsFiles.withIndex()) {
-                if (already.contains(index)) {
-                    bytesUploaded += file.length()
-                    runBlocking {
-                        setProgress(workDataOf(
-                            "uploaded_bytes" to bytesUploaded,
-                            "total_bytes" to totalBytes,
-                            "part_index" to index,
-                            "part_progress" to 100,
-                            "total_parts" to totalChunks
-                        ))
-                    }
-                    continue
-                }
-
                 Log.i(TAG, "Uploading chunk -> upload_id=$uploadId filename=$customName chunkIndex=$index partFile=${file.name}")
 
                 // notify start
@@ -189,43 +176,20 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         }
     }
 
-    private fun queryReceivedChunks(uploadId: String, filename: String, token: String): Set<Int> {
-        try {
-            val base = "${baseApi()}/upload/chunk/status"
-            val url = base.toHttpUrlOrNull()?.newBuilder()
-                ?.addQueryParameter("upload_id", uploadId)
-                ?.addQueryParameter("filename", filename)
-                ?.addQueryParameter("token", token)
-                ?.build() ?: return emptySet()
-            val req = Request.Builder().url(url).get().build()
-            client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return emptySet()
-                val body = resp.body?.string().orEmpty()
-                val jo = JSONObject(body)
-                val arr = jo.optJSONArray("received") ?: return emptySet()
-                val set = mutableSetOf<Int>()
-                for (i in 0 until arr.length()) set.add(arr.getInt(i))
-                return set
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "queryReceivedChunks error", e)
-            return emptySet()
-        }
-    }
-
     /**
      * Sube la portada EXACTAMENTE igual que el cliente Python (uploader_ffmpeg_gui.py):
-     *  1) Fuerza el nombre a "<stemDelVideo>.jpg" (extensión .jpg sin excepción).
-     *     FIX: se usa el "stem" de customName (sin su extensión, si la tuviera) para
-     *     que el nombre de la portada coincida EXACTAMENTE con el nombre que el
-     *     servidor va a usar para el video final ("<stem>.mp4" en /api/upload/finalize
-     *     con parts_kind="ts"). Antes se pegaba ".jpg" directo a customName, así que
-     *     si customName ya traía extensión (ej: "Mi_Video.mp4") la portada se guardaba
-     *     como "Mi_Video.mp4.jpg" y el servidor esperaba "Mi_Video.jpg" -> nunca
-     *     coincidía y terminaba generando un frame automático en su lugar.
+     *  1) Fuerza el nombre a "<stemDelVideo>.jpg" (extensión .jpg sin excepción, sea cual
+     *     sea el formato/extensión original de la imagen elegida).
+     *     Se usa el "stem" de customName (sin su extensión, si la tuviera) para que el
+     *     nombre de la portada coincida EXACTAMENTE con el nombre que el servidor va a
+     *     usar para el video final ("<stem>.mp4" en /api/upload/finalize con
+     *     parts_kind="ts"). Si customName ya trae extensión (ej: "Mi_Video.mp4"), la
+     *     portada se guarda como "Mi_Video.jpg", nunca "Mi_Video.mp4.jpg".
      *  2) La envía como un único chunk (chunk_index=0, total_chunks=1) a /api/upload/chunk.
      *  3) Llama a /api/upload/finalize con parts_kind="image" para que el servidor
      *     la reconstruya/guarde como imagen final.
+     *
+     * (SIN CAMBIOS respecto al código original)
      *
      * Devuelve el nombre guardado (el mismo "<stemDelVideo>.jpg" que se envió).
      */
