@@ -51,12 +51,27 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
         override fun writeTo(sink: okio.BufferedSink) {
             val countingSink = object : ForwardingSink(sink) {
                 var bytesWritten = 0L
+                var lastReportedPct = -1
                 val total = contentLength()
                 @Throws(IOException::class)
                 override fun write(source: Buffer, byteCount: Long) {
                     super.write(source, byteCount)
                     bytesWritten += byteCount
-                    onProgress(bytesWritten, if (total >= 0) total else -1L)
+                    // CORRECCIÓN: Okio llama a write() muchas veces por archivo (no una
+                    // vez por chunk completo). Antes, cada una de esas llamadas disparaba
+                    // onProgress() -> runBlocking { setProgress(...) }, y setProgress()
+                    // persiste el progreso en la base de datos interna de WorkManager, lo
+                    // que implica I/O de disco en cada llamada. Para un .ts de varios MB
+                    // eso significaba cientos/miles de escrituras a disco por chunk,
+                    // serializadas con la propia subida, haciendo todo mucho más lento.
+                    // Ahora solo se reporta cuando el porcentaje entero cambia (~100
+                    // reportes por chunk como máximo, en vez de miles).
+                    val t = if (total >= 0) total else -1L
+                    val pct = if (t > 0) ((bytesWritten * 100.0) / t).toInt() else -1
+                    if (pct != lastReportedPct) {
+                        lastReportedPct = pct
+                        onProgress(bytesWritten, t)
+                    }
                 }
             }
             val buffered = countingSink.buffer()
