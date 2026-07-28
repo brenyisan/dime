@@ -215,15 +215,23 @@ class UploadWorker(appContext: android.content.Context, workerParams: WorkerPara
 
     /**
      * Sube la portada EXACTAMENTE igual que el cliente Python (uploader_ffmpeg_gui.py):
-     *  1) Fuerza el nombre a "<customName>.jpg" (extensión .jpg sin excepción).
+     *  1) Fuerza el nombre a "<stemDelVideo>.jpg" (extensión .jpg sin excepción).
+     *     FIX: se usa el "stem" de customName (sin su extensión, si la tuviera) para
+     *     que el nombre de la portada coincida EXACTAMENTE con el nombre que el
+     *     servidor va a usar para el video final ("<stem>.mp4" en /api/upload/finalize
+     *     con parts_kind="ts"). Antes se pegaba ".jpg" directo a customName, así que
+     *     si customName ya traía extensión (ej: "Mi_Video.mp4") la portada se guardaba
+     *     como "Mi_Video.mp4.jpg" y el servidor esperaba "Mi_Video.jpg" -> nunca
+     *     coincidía y terminaba generando un frame automático en su lugar.
      *  2) La envía como un único chunk (chunk_index=0, total_chunks=1) a /api/upload/chunk.
      *  3) Llama a /api/upload/finalize con parts_kind="image" para que el servidor
      *     la reconstruya/guarde como imagen final.
      *
-     * Devuelve el nombre guardado (el mismo "<customName>.jpg" que se envió).
+     * Devuelve el nombre guardado (el mismo "<stemDelVideo>.jpg" que se envió).
      */
     private fun uploadPortadaFile(file: File, token: String, customName: String): String? {
-        val nuevoNombre = "$customName.jpg"
+        val baseName = customName.substringBeforeLast(".", customName)
+        val nuevoNombre = "$baseName.jpg"
         val coverUploadId = "up-${UUID.randomUUID().toString().replace("-", "").take(28)}"
 
         // --- Paso 1: subir la imagen completa como chunk único (0 de 1) ---
